@@ -43,3 +43,18 @@ systemctl list-timers codeg-update.timer
 
 Port 3080 is plain HTTP. Keep it on a trusted LAN or put it behind a VPN or a
 TLS reverse proxy before exposing it to the public internet.
+
+## Upstream fork sync
+
+`install-upstream-sync.sh` configures one host to check upstream every six
+hours. The sync uses a repository-scoped write deploy key and a normal
+fast-forward push. It refuses to overwrite a diverged fork `main`.
+
+After registering the printed public key on `markos-ttl/codeg`, start the first
+sync and inspect it with:
+
+```bash
+sudo systemctl start codeg-upstream-sync.service
+systemctl status codeg-upstream-sync.service
+systemctl list-timers codeg-upstream-sync.timer
+```

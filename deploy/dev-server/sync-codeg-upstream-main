@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly state_dir="/var/lib/codeg-upstream-sync"
+readonly repo_dir="$state_dir/repo.git"
+readonly key_file="/etc/codeg-upstream-sync/id_ed25519"
+readonly upstream_url="https://github.com/xintaofei/codeg.git"
+readonly fork_url="git@github.com:markos-ttl/codeg.git"
+
+if [[ ! -f "$key_file" ]]; then
+  echo "Missing repository deploy key: $key_file" >&2
+  exit 1
+fi
+
+install -d -m 0700 "$state_dir"
+if [[ ! -d "$repo_dir" ]]; then
+  git init --bare "$repo_dir"
+fi
+
+git --git-dir="$repo_dir" fetch --prune "$upstream_url" \
+  refs/heads/main:refs/heads/upstream-main
+
+export GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+git --git-dir="$repo_dir" push "$fork_url" \
+  refs/heads/upstream-main:refs/heads/main
