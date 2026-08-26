@@ -1,0 +1,134 @@
+name: Build dev desktop apps
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-desktop
+  cancel-in-progress: true
+
+env:
+  HUSKY: 0
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare rolling dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git tag --force dev-latest "$GITHUB_SHA"
+          git push --force origin refs/tags/dev-latest
+
+          if gh release view dev-latest >/dev/null 2>&1; then
+            gh release edit dev-latest \
+              --target "$GITHUB_SHA" \
+              --title "Codeg dev builds" \
+              --notes "Rolling server and desktop builds from the dev branch at $GITHUB_SHA." \
+              --prerelease
+          else
+            gh release create dev-latest \
+              --target "$GITHUB_SHA" \
+              --title "Codeg dev builds" \
+              --notes "Rolling server and desktop builds from the dev branch at $GITHUB_SHA." \
+              --prerelease
+          fi
+
+  build-desktop:
+    needs: prepare-release
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bundle: dmg
+            source: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            asset: codeg-dev-macos-arm64.dmg
+          - name: Windows x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundle: nsis
+            source: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+            asset: codeg-dev-windows-x64-setup.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          shared-key: dev-desktop-${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage codeg-mcp sidecar
+        shell: bash
+        run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+
+      - name: Build desktop installer
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ contains(matrix.target, 'apple-darwin') && '-' || '' }}
+          CODEG_SKIP_SIDECAR: "1"
+        run: |
+          pnpm tauri build \
+            --target ${{ matrix.target }} \
+            --bundles ${{ matrix.bundle }} \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          matches=( ${{ matrix.source }} )
+          if [ "${#matches[@]}" -ne 1 ] || [ ! -f "${matches[0]}" ]; then
+            echo "Expected exactly one installer at ${{ matrix.source }}"
+            printf '%s\n' "${matches[@]}"
+            exit 1
+          fi
+          cp "${matches[0]}" "dist/${{ matrix.asset }}"
+          shasum -a 256 "dist/${{ matrix.asset }}" > "dist/${{ matrix.asset }}.sha256"
+
+      - name: Upload installer to rolling dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload dev-latest \
+            "dist/${{ matrix.asset }}" \
+            "dist/${{ matrix.asset }}.sha256" \
+            --clobber

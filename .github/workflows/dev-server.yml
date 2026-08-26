@@ -79,15 +79,15 @@ jobs:
               --clobber
             gh release edit dev-latest \
               --target "$GITHUB_SHA" \
-              --title "Codeg dev server" \
-              --notes "Rolling Linux x64 server build from the dev branch at $GITHUB_SHA." \
+              --title "Codeg dev builds" \
+              --notes "Rolling server and desktop builds from the dev branch at $GITHUB_SHA." \
               --prerelease
           else
             gh release create dev-latest \
               dist/codeg-server-linux-x64.tar.gz \
               dist/codeg-server-linux-x64.tar.gz.sha256 \
               --target "$GITHUB_SHA" \
-              --title "Codeg dev server" \
-              --notes "Rolling Linux x64 server build from the dev branch at $GITHUB_SHA." \
+              --title "Codeg dev builds" \
+              --notes "Rolling server and desktop builds from the dev branch at $GITHUB_SHA." \
               --prerelease
           fi
