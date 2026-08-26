@@ -121,7 +121,8 @@ jobs:
             exit 1
           fi
           cp "${matches[0]}" "dist/${{ matrix.asset }}"
-          shasum -a 256 "dist/${{ matrix.asset }}" > "dist/${{ matrix.asset }}.sha256"
+          node -e "const fs=require('fs'),crypto=require('crypto');const p=process.argv[1];console.log(crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')+'  '+p)" \
+            "dist/${{ matrix.asset }}" > "dist/${{ matrix.asset }}.sha256"
 
       - name: Upload installer to rolling dev release
         env:
