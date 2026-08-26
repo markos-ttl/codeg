@@ -37,8 +37,10 @@ import {
 } from "@/lib/file-open-target"
 import { isAbsoluteFilePath } from "@/lib/file-path-display"
 import {
+  isHiddenPath,
   isHtmlPreviewable,
   isImageFile,
+  isOfficeOwnerFile,
   isOfficePreviewable,
   languageFromPath,
 } from "@/lib/language-detect"
@@ -252,8 +254,12 @@ function normalizePath(path: string): string {
   return path.replace(/\\/g, "/")
 }
 
+// Most callers pass an already-normalized path, but the working-diff overview
+// titles the tab after the FOLDER path, which is native — on Windows a
+// "/"-only split handed back `C:\work\repo` as the file name.
 function fileName(path: string): string {
-  return path.split("/").pop() || path
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))
+  return (index >= 0 ? path.slice(index + 1) : path) || path
 }
 
 function isDirtyFileTab(tab: FileWorkspaceTab): boolean {
@@ -1293,6 +1299,18 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       )
       for (const changed of changed_paths) {
         if (!isOfficePreviewable(changed)) continue
+        // Dot-prefixed paths are hidden/machine-owned (editor lock files,
+        // AppleDouble sidecars, anything under `.git`/`.tmp`) — never a
+        // document the agent meant to show. Skipping here means we neither
+        // open a tab for one nor spawn its `officecli watch` process; a user
+        // who wants one can still open it by hand from the file tree.
+        if (isHiddenPath(changed)) continue
+        // Office/WPS owner files (`~$report.docx`) are the same story under a
+        // different naming convention, and the one that actually bites: they
+        // carry a real office extension, so nothing above rejects them, and
+        // opening a folder of documents externally drops a whole burst of them
+        // at once — which arrived here as a dozen unreadable previews.
+        if (isOfficeOwnerFile(changed)) continue
         const abs = joinRootRel(streamRoot, changed)
         if (autoOpened.has(abs) || openPaths.has(abs)) continue
         autoOpened.add(abs)

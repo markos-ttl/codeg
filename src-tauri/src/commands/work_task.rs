@@ -6,7 +6,7 @@
 //! a clean "engine not running" error.
 
 use crate::app_error::AppCommandError;
-use crate::commands::folders::{get_folder_core, git_diff_with_branch};
+use crate::commands::folders::get_folder_core;
 use crate::db::entities::work_task::WorkTaskStatus;
 use crate::db::error::DbError;
 use crate::db::service::work_task_service;
@@ -28,7 +28,7 @@ fn engine() -> Result<std::sync::Arc<crate::work_task::TaskEngine>, DbError> {
 /// requeues and settings changes without waiting for the reconcile tick. A
 /// process not holding the engine lock skips it — the owning process's tick
 /// picks the change up from the DB.
-fn nudge_pump(folder_id: i32) {
+pub(crate) fn nudge_pump(folder_id: i32) {
     if let Some(engine) = crate::work_task::engine() {
         tokio::spawn(async move { engine.pump_folder(folder_id).await });
     }
@@ -238,17 +238,98 @@ pub async fn work_task_create_core(
 pub async fn work_task_update_core(
     emitter: &EventEmitter,
     db: &AppDatabase,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
     id: i32,
     draft: WorkTaskDraft,
 ) -> Result<WorkTaskInfo, DbError> {
+    // Read the pre-edit name first: a session this card already produced was
+    // named after it (and locked), so a rename here should carry over — but only
+    // while the two are still in sync, which only the OLD name can attest.
+    let before = work_task_service::get_model(&db.conn, id).await.ok();
+
     let info = work_task_service::update(&db.conn, id, draft).await?;
     emit_event(
         emitter,
         WORK_TASK_CHANGED_EVENT,
         WorkTaskChange::Upsert { id },
     );
+    if let Some(before) = before {
+        rename_task_conversation(emitter, db, chat_channel_manager, &before, &info.title).await;
+    }
     nudge_pump(info.folder_id);
     Ok(info)
+}
+
+/// Carry a card's rename over to the session it produced. Only reachable from
+/// the editable statuses (`todo` / `failed` / `canceled`), so in practice this
+/// fires for a task the user is re-shaping after a failed or canceled run.
+///
+/// Best-effort and deliberately narrow: `retitle_if_unchanged` writes only if
+/// the conversation still carries the card's PREVIOUS name, so a session the
+/// user renamed by hand keeps the name they chose. A skipped or failed write
+/// costs a stale title, never the edit itself.
+///
+/// A written title is pushed on to the chat channels exactly as
+/// `update_conversation_title` does. Engine-minted rows are not off-limits to
+/// bindings: Telegram's `/resume <id>` takes ANY conversation id and binds it to
+/// the forum topic it was typed in, so a task's session can own a topic whose
+/// name would otherwise go stale forever — locked titles never pass through the
+/// auto-title path that would re-sync it.
+///
+/// Known limitation (deliberate): the guard is a VALUE, not provenance, and the
+/// card's own edit path is last-writer-wins with no CAS. Two clients editing the
+/// same card at the same instant can therefore leave the session on the losing
+/// name, and it will not re-sync — the next edit compares against a name the row
+/// no longer carries. The cost is a stale display title on a failed/canceled
+/// card; telling "the card named this" from "the user named this" apart for real
+/// needs a provenance column on `conversation`, which is not worth it here.
+async fn rename_task_conversation(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    before: &crate::db::entities::work_task::Model,
+    new_title: &str,
+) {
+    use crate::work_task::engine::conversation_title_for_task;
+
+    let Some(conversation_id) = before.conversation_id else {
+        return;
+    };
+    let (old, new) = (
+        conversation_title_for_task(&before.title),
+        conversation_title_for_task(new_title),
+    );
+    if old == new {
+        return;
+    }
+    match crate::db::service::conversation_service::retitle_if_unchanged(
+        &db.conn,
+        conversation_id,
+        &old,
+        &new,
+    )
+    .await
+    {
+        Ok(true) => {
+            crate::commands::conversations::emit_conversation_upsert(
+                emitter,
+                &db.conn,
+                conversation_id,
+            )
+            .await;
+            crate::commands::conversations::sync_conversation_title_to_channels_core(
+                &db.conn,
+                chat_channel_manager,
+                conversation_id,
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "[work_task] task {}: could not retitle conversation {conversation_id}: {e}",
+            before.id
+        ),
+    }
 }
 
 /// How many times a delete re-reads before giving up. A retry only happens when
@@ -355,9 +436,10 @@ pub async fn work_task_retry_core(
     id: i32,
     note: Option<String>,
     blocks: Vec<serde_json::Value>,
+    allow_duplicate_source: bool,
 ) -> Result<(), DbError> {
     engine()?
-        .retry(id, note, blocks)
+        .retry(id, note, blocks, allow_duplicate_source)
         .await
         .map_err(DbError::Validation)
 }
@@ -371,8 +453,17 @@ pub async fn work_task_requeue_core(
     id: i32,
     note: Option<String>,
     blocks: Vec<serde_json::Value>,
+    allow_duplicate_source: bool,
 ) -> Result<(), DbError> {
-    if !work_task_service::requeue_canceled(&db.conn, id, note.as_deref(), &blocks).await? {
+    if !work_task_service::requeue_canceled(
+        &db.conn,
+        id,
+        note.as_deref(),
+        &blocks,
+        allow_duplicate_source,
+    )
+    .await?
+    {
         return Err(DbError::Validation("task is not canceled".to_string()));
     }
     emit_event(
@@ -454,7 +545,8 @@ pub async fn work_task_cancel_core(id: i32, reason: Option<String>) -> Result<()
 /// the outcome rides the `task://changed` events (merging → done, or back to
 /// review with a readable error). This awaits only the dispatch (validation +
 /// agent spawn), so refused merges surface directly in the dialog.
-/// `message: None` = the agent writes the commit message itself.
+/// `message: None` = the agent writes the commit message itself;
+/// `instructions: None` = the user added nothing beyond the standing recipe.
 ///
 /// Returns `true` when the merge was QUEUED instead of started — the folder was
 /// already landing another task, and this one goes in as soon as that finishes.
@@ -462,9 +554,10 @@ pub async fn work_task_merge_core(
     id: i32,
     message: Option<String>,
     delete_worktree: bool,
+    instructions: Option<String>,
 ) -> Result<bool, DbError> {
     engine()?
-        .merge_task(id, message, delete_worktree, false)
+        .merge_task(id, message, delete_worktree, instructions, false)
         .await
         .map(|dispatch| dispatch.is_queued())
         .map_err(DbError::Validation)
@@ -489,6 +582,32 @@ pub async fn work_task_merge_unqueue_core(
         WorkTaskChange::Upsert { id },
     );
     Ok(())
+}
+
+/// Accept a reviewed forge-sourced task by pushing it back to the repository
+/// it came from: an issue's task opens (or adopts) a pull request for its own
+/// branch, a pull request's task pushes onto that pull request's branch.
+/// Returns the pull request URL.
+///
+/// Unlike the merge dispatch this awaits the WHOLE operation — a push plus two
+/// REST calls, no agent — so both success and failure land in the caller's
+/// dialog. Every gate is inside the engine, where a direct API call cannot
+/// route around it.
+///
+/// `delete_worktree` takes the checkout along once the delivery lands, the
+/// same offer the merge and complete acceptances make. It never changes the
+/// result: a removal that fails leaves a retryable `cleanup_state` on the card
+/// and the delivered URL still comes back.
+pub async fn work_task_deliver_pr_core(
+    id: i32,
+    pr_title: Option<String>,
+    draft: bool,
+    delete_worktree: bool,
+) -> Result<String, DbError> {
+    engine()?
+        .deliver_pr(id, pr_title, draft, delete_worktree)
+        .await
+        .map_err(DbError::Validation)
 }
 
 /// Finish a reviewed task that has nothing to land (review → done, no merge),
@@ -530,6 +649,12 @@ pub async fn work_task_cleanup_core(id: i32) -> Result<(), DbError> {
 
 /// Diff of the task worktree vs. its recorded base (`base_sha`, so the view is
 /// stable even when the base branch advances). `file = None` → full patch.
+///
+/// Uncommitted work is part of it: nothing makes the agent commit before the
+/// task reaches review (the merge generation commits the leftovers itself), so
+/// a review that showed only committed work would be reviewing half the task.
+/// New files therefore render as `new file mode` hunks rather than as an empty
+/// diff — see [`crate::work_task::git::diff_patch_with_untracked`].
 pub async fn work_task_diff_core(
     db: &AppDatabase,
     id: i32,
@@ -549,9 +674,12 @@ pub async fn work_task_diff_core(
     let wt = get_folder_core(db, wt_id)
         .await
         .map_err(AppCommandError::from)?;
-    git_diff_with_branch(wt.path, base, file).await
+    crate::work_task::git::diff_patch_with_untracked(&wt.path, &base, file.as_deref()).await
 }
 
+/// The file list behind that diff — same base, same "uncommitted work counts"
+/// rule, so the drawer's list and the row's counters cannot tell two different
+/// stories about the same task.
 pub async fn work_task_changed_files_core(
     db: &AppDatabase,
     id: i32,
@@ -568,7 +696,7 @@ pub async fn work_task_changed_files_core(
     let wt = get_folder_core(db, wt_id)
         .await
         .map_err(AppCommandError::from)?;
-    crate::work_task::git::diff_numstat(&wt.path, &base).await
+    crate::work_task::git::diff_numstat_with_untracked(&wt.path, &base).await
 }
 
 pub async fn work_task_settings_get_core(
@@ -704,10 +832,18 @@ pub async fn work_task_create(
 pub async fn work_task_update(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     id: i32,
     draft: WorkTaskDraft,
 ) -> Result<WorkTaskInfo, DbError> {
-    work_task_update_core(&EventEmitter::Tauri(app), &db, id, draft).await
+    work_task_update_core(
+        &EventEmitter::Tauri(app),
+        &db,
+        &chat_channel_manager,
+        id,
+        draft,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -756,8 +892,15 @@ pub async fn work_task_retry(
     id: i32,
     note: Option<String>,
     blocks: Option<Vec<serde_json::Value>>,
+    allow_duplicate_source: Option<bool>,
 ) -> Result<(), DbError> {
-    work_task_retry_core(id, note, blocks.unwrap_or_default()).await
+    work_task_retry_core(
+        id,
+        note,
+        blocks.unwrap_or_default(),
+        allow_duplicate_source.unwrap_or(false),
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -768,6 +911,7 @@ pub async fn work_task_requeue(
     id: i32,
     note: Option<String>,
     blocks: Option<Vec<serde_json::Value>>,
+    allow_duplicate_source: Option<bool>,
 ) -> Result<(), DbError> {
     work_task_requeue_core(
         &EventEmitter::Tauri(app),
@@ -775,6 +919,7 @@ pub async fn work_task_requeue(
         id,
         note,
         blocks.unwrap_or_default(),
+        allow_duplicate_source.unwrap_or(false),
     )
     .await
 }
@@ -813,8 +958,9 @@ pub async fn work_task_merge(
     id: i32,
     message: Option<String>,
     delete_worktree: bool,
+    instructions: Option<String>,
 ) -> Result<bool, DbError> {
-    work_task_merge_core(id, message, delete_worktree).await
+    work_task_merge_core(id, message, delete_worktree, instructions).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -825,6 +971,17 @@ pub async fn work_task_merge_unqueue(
     id: i32,
 ) -> Result<(), DbError> {
     work_task_merge_unqueue_core(&EventEmitter::Tauri(app), &db, id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_deliver_pr(
+    id: i32,
+    pr_title: Option<String>,
+    draft: bool,
+    delete_worktree: bool,
+) -> Result<String, DbError> {
+    work_task_deliver_pr_core(id, pr_title, draft, delete_worktree).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -1056,5 +1213,228 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(agent_of(&db, task.id).await.as_deref(), Some("cursor"));
+    }
+
+    fn test_emitter() -> EventEmitter {
+        EventEmitter::test_web_only(std::sync::Arc::new(
+            crate::web::event_bridge::WebEventBroadcaster::new(),
+        ))
+    }
+
+    /// No backend is registered on a bare manager, so a title sync reaches the
+    /// binding lookup and then stops at `NotFound` — no network, no waiting.
+    fn test_channels() -> crate::chat_channel::manager::ChatChannelManager {
+        crate::chat_channel::manager::ChatChannelManager::new()
+    }
+
+    /// The state the engine leaves behind once a card has produced a session.
+    async fn bind_conversation(db: &AppDatabase, task_id: i32, conversation_id: i32) {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let row = crate::db::entities::work_task::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("task row");
+        let mut active = row.into_active_model();
+        active.conversation_id = Set(Some(conversation_id));
+        active.update(&db.conn).await.unwrap();
+    }
+
+    async fn conversation_title(db: &AppDatabase, id: i32) -> Option<String> {
+        crate::db::service::conversation_service::get_by_id(&db.conn, id)
+            .await
+            .unwrap()
+            .title
+    }
+
+    /// Renaming a card renames the session it produced: the two must not drift
+    /// apart, or the sidebar goes back to showing a name nothing on the board
+    /// answers to (issue #495).
+    #[tokio::test]
+    async fn renaming_a_task_renames_the_session_it_produced() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+        let conv = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        crate::db::service::conversation_service::update_title(
+            &db.conn,
+            conv,
+            "Fix login".to_string(),
+        )
+        .await
+        .unwrap();
+        bind_conversation(&db, task.id, conv).await;
+
+        work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Fix logout too", None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conversation_title(&db, conv).await.as_deref(),
+            Some("Fix logout too")
+        );
+    }
+
+    /// …but a session the user named themselves keeps that name. Both titles
+    /// are `title_locked`, so only the card's PREVIOUS name can tell "still in
+    /// sync" from "the user picked this".
+    #[tokio::test]
+    async fn renaming_a_task_leaves_a_hand_named_session_alone() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle-manual").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+        let conv = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        crate::db::service::conversation_service::update_title(
+            &db.conn,
+            conv,
+            "My own name".to_string(),
+        )
+        .await
+        .unwrap();
+        bind_conversation(&db, task.id, conv).await;
+
+        work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Fix logout too", None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conversation_title(&db, conv).await.as_deref(),
+            Some("My own name"),
+            "a hand-picked session name outranks the card it came from"
+        );
+    }
+
+    /// A task's session CAN own a chat-channel thread: Telegram's `/resume <id>`
+    /// takes any conversation id and binds it to the forum topic it was typed
+    /// in (`chat_channel/session_commands.rs::handle_resume`). So the rename has
+    /// to walk the same channel-sync path a manual rename does — a locked title
+    /// never passes through the auto-title backfill that would otherwise
+    /// re-sync the topic, so skipping it here would strand the topic name
+    /// forever.
+    ///
+    /// The remote edit itself is not observable here (a bare manager has no
+    /// backend registered, so the sync stops at `NotFound` without touching the
+    /// network); what this pins is that the path is wired, reached with a real
+    /// binding in place, and leaves the binding row intact.
+    #[tokio::test]
+    async fn renaming_a_task_syncs_a_bound_session_through_the_channel_path() {
+        use crate::chat_channel::types::{ChannelMessageTarget, TELEGRAM_FORUM_THREAD_KIND};
+        use crate::db::service::thread_binding_service;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle-bound").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+        let conv = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        crate::db::service::conversation_service::update_title(
+            &db.conn,
+            conv,
+            "Fix login".to_string(),
+        )
+        .await
+        .unwrap();
+        bind_conversation(&db, task.id, conv).await;
+
+        // The binding is FK-constrained to a real channel row.
+        let channel = {
+            use sea_orm::{ActiveModelTrait, NotSet, Set};
+            let now = chrono::Utc::now();
+            crate::db::entities::chat_channel::ActiveModel {
+                id: NotSet,
+                name: Set("tg".to_string()),
+                channel_type: Set("telegram".to_string()),
+                enabled: Set(true),
+                config_json: Set("{}".to_string()),
+                event_filter_json: Set(None),
+                daily_report_enabled: Set(false),
+                daily_report_time: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db.conn)
+            .await
+            .expect("seed channel")
+            .id
+        };
+        let target = ChannelMessageTarget {
+            channel_id: channel,
+            chat_id: Some("-100123".to_string()),
+            thread_key: Some("42".to_string()),
+            thread_kind: Some(TELEGRAM_FORUM_THREAD_KIND.to_string()),
+            provider_payload: None,
+        };
+        thread_binding_service::upsert_for_target(
+            &db.conn,
+            &target,
+            "telegram",
+            conv,
+            None,
+            "sender",
+            Some("Fix login".to_string()),
+        )
+        .await
+        .expect("bind topic");
+
+        work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Fix logout too", None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conversation_title(&db, conv).await.as_deref(),
+            Some("Fix logout too")
+        );
+        let bindings = thread_binding_service::list_by_conversation(&db.conn, conv)
+            .await
+            .expect("bindings");
+        assert_eq!(bindings.len(), 1, "the binding must survive the rename");
+        assert!(
+            bindings[0].title_sync_enabled,
+            "the rename must not disable title sync on the topic"
+        );
+    }
+
+    /// A card that never ran has no session to follow it — the edit must still
+    /// succeed, untouched by the propagation path.
+    #[tokio::test]
+    async fn renaming_a_task_without_a_session_is_harmless() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle-none").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+
+        let info = work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Renamed", None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.title, "Renamed");
     }
 }

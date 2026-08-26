@@ -155,10 +155,19 @@ import { getInstallErrorHintKey } from "@/lib/agent-install-error"
 import { addKiloModels } from "@/lib/kilo-model-config"
 import { useAgentInstallStream } from "@/hooks/use-agent-install-stream"
 import { OpencodePluginsModal } from "./opencode-plugins-modal"
+import {
+  ANTIGRAVITY_ENV_KEYS,
+  AntigravityConfigPanel,
+} from "./antigravity-config-panel"
 import { CodeBuddyConfigPanel } from "./codebuddy-config-panel"
 import { CursorConfigPanel } from "./cursor-config-panel"
+import {
+  DEEPSEEK_PANEL_ENV_KEYS,
+  DeepSeekConfigPanel,
+} from "./deepseek-config-panel"
 import { KimiCodeConfigPanel } from "./kimi-code-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
+import { QoderConfigPanel } from "./qoder-config-panel"
 
 interface AgentCheckState {
   result?: PreflightResult
@@ -193,6 +202,9 @@ interface AgentDraft {
   codexReasoningEffort: CodexReasoningEffort
   codexSupportsWebsockets: boolean
   codexSkills: boolean
+  /** `[features].default_mode_request_user_input` — see
+   * {@link CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY}. */
+  codexDefaultModeRequestUserInput: boolean
   codexServiceTierFast: boolean
   /** Sandbox / approval group — the thread defaults codex applies to turns it
    * starts itself (`/goal`, `/review`, `/compact`). Held as plain draft state
@@ -406,20 +418,100 @@ function parseEnvText(envText: string): Record<string, string> {
   return map
 }
 
+/**
+ * Fold the DeepSeek panel's own env keys, as they are actually persisted, into
+ * an existing draft. Everything else in the draft — other keys, and any
+ * unsaved edit to them — is left exactly as it was.
+ *
+ * Returns the draft unchanged when nothing moved, so this never invalidates a
+ * memo or restarts a render for a no-op refresh.
+ */
+export function rebaseDeepSeekDraft(
+  draft: AgentDraft,
+  agent: AcpAgentInfo
+): AgentDraft {
+  // Decide on the VALUES, before rewriting anything, so an unrelated refresh
+  // leaves the draft object (and its text) untouched.
+  //
+  // Mirrors `patchEnvText`'s own rule exactly: an empty persisted value means
+  // DELETE the key, so `KEY=` present in the draft while the agent has no such
+  // key IS a difference — the enable switch persists the draft wholesale, and
+  // an empty `DEEPSEEK_BASE_URL` is not "use the default", it is an empty
+  // endpoint.
+  const current = parseEnvText(draft.envText)
+  const patch: Record<string, string | undefined> = {}
+  let moved = false
+  for (const key of DEEPSEEK_PANEL_ENV_KEYS) {
+    patch[key] = agent.env[key]
+    const next = (agent.env[key] ?? "").trim()
+    const present = key in current
+    if (next ? current[key] !== next : present) moved = true
+  }
+  if (!moved) return draft
+  const envText = patchEnvText(draft.envText, patch)
+  if (envText === draft.envText) return draft
+  const keys = importantEnvKeysByAgent("deepseek")
+  const merged = parseEnvText(envText)
+  return {
+    ...draft,
+    envText,
+    apiBaseUrl: findEnvValue(merged, keys.apiBaseUrl),
+    apiKey: findEnvValue(merged, keys.apiKey),
+    model: findEnvValue(merged, keys.model),
+  }
+}
+
+/**
+ * Set (or, for an empty value, delete) exactly the given keys in a raw env
+ * draft, leaving every other LINE byte-identical.
+ *
+ * Textual on purpose. The obvious implementation — parse to a map, patch,
+ * serialize — rewrites the whole textarea, and the parser only understands
+ * `KEY=VALUE`: a comment, a blank line, and a half-typed `NEW_PROXY` all
+ * vanish. These patches run on refresh and on save completion, so that would
+ * silently delete what the user is still typing in the raw editor next to the
+ * structured panel that triggered the save.
+ *
+ * A key appearing on several lines collapses to one (its patched value), which
+ * matches how `parseEnvText` reads the draft afterwards.
+ */
 function patchEnvText(
   envText: string,
   patch: Record<string, string | undefined>
 ): string {
-  const envMap = parseEnvText(envText)
-  for (const [key, value] of Object.entries(patch)) {
-    const trimmed = value?.trim() ?? ""
-    if (!trimmed) {
-      delete envMap[key]
-    } else {
-      envMap[key] = trimmed
+  // `key in patch` would also answer yes for `constructor`, `toString` and the
+  // rest of Object.prototype — all of them legal env var names — and then read
+  // a function where a string was expected. Own properties only.
+  const owns = (key: string) => Object.prototype.hasOwnProperty.call(patch, key)
+  const pending = new Set(
+    Object.keys(patch).filter((key) => (patch[key]?.trim() ?? "") !== "")
+  )
+  const lines = envText === "" ? [] : envText.split(/\r?\n/)
+  const kept: string[] = []
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    const idx = line.startsWith("#") ? -1 : line.indexOf("=")
+    const key = idx > 0 ? line.slice(0, idx).trim() : ""
+    if (!key || !owns(key)) {
+      kept.push(rawLine)
+      continue
     }
+    const value = patch[key]?.trim() ?? ""
+    // Empty ⇒ the key is being removed; a duplicate line for a key already
+    // emitted goes too, so the result reads back as the value just written.
+    if (!value || !pending.delete(key)) continue
+    kept.push(`${key}=${value}`)
   }
-  return envMapToText(envMap)
+  if (pending.size > 0) {
+    // A key with no line yet goes after the last real one, not after the blank
+    // line the user may be about to type into.
+    let end = kept.length
+    while (end > 0 && kept[end - 1].trim() === "") end -= 1
+    const tail = kept.splice(end)
+    for (const key of pending) kept.push(`${key}=${patch[key]?.trim() ?? ""}`)
+    kept.push(...tail)
+  }
+  return kept.join("\n")
 }
 
 /**
@@ -629,7 +721,9 @@ export function inferGrokMode(
   return (env[GROK_API_KEY_ENV] ?? "").trim() ? "api_key" : "subscription"
 }
 
-function importantEnvKeysByAgent(agentType: AgentType): ImportantEnvKeys {
+export function importantEnvKeysByAgent(
+  agentType: AgentType
+): ImportantEnvKeys {
   if (agentType === "claude_code") {
     return {
       apiBaseUrl: ["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "API_BASE_URL"],
@@ -663,10 +757,62 @@ function importantEnvKeysByAgent(agentType: AgentType): ImportantEnvKeys {
       model: ["GROK_DEFAULT_MODEL", "MODEL"],
     }
   }
+  if (agentType === "deepseek") {
+    // The endpoint knob is DEEPSEEK_BASE_URL (read per request by the
+    // `llm-deepseek` adapter through the launch-environment snapshot, which
+    // falls back to `process.env`). DEEPSEEK_ACP_PROVIDER is NOT it — that's
+    // the provider ROUTE id, so binding a model provider to it would write a
+    // URL into a registry key. Mirrors the backend `agent_env_keys(DeepSeek)`;
+    // generic OPENAI_*/API_KEY aliases are NOT read.
+    return {
+      apiBaseUrl: ["DEEPSEEK_BASE_URL"],
+      apiKey: ["DEEPSEEK_API_KEY"],
+      model: ["DEEPSEEK_ACP_MODEL"],
+    }
+  }
+  if (agentType === "qoder") {
+    // `QODER_PERSONAL_ACCESS_TOKEN` is Qoder's non-interactive credential
+    // ("设置后自动使用 PAT 认证" in the CLI package's own README) and the only
+    // way to authenticate a headless/server/Docker install, where the
+    // `qoder login` browser flow cannot run. `QODER_MODEL` is the env twin of
+    // `-m/--model`. Qoder talks only to its own service, so there is no
+    // endpoint var at all — an EMPTY list here hides that field rather than
+    // offering a box whose value nothing reads (see `importantFieldsFor`).
+    // Generic OPENAI_*/API_KEY aliases are deliberately absent: Qoder reads
+    // neither, and listing them would let the panel report "configured" off a
+    // key that never reaches it. Mirrors the backend `agent_env_keys(Qoder)`.
+    return {
+      apiBaseUrl: [],
+      apiKey: ["QODER_PERSONAL_ACCESS_TOKEN"],
+      model: ["QODER_MODEL"],
+    }
+  }
   return {
     apiBaseUrl: ["OPENAI_BASE_URL", "API_BASE_URL"],
     apiKey: ["OPENAI_API_KEY", "API_KEY"],
     model: ["OPENAI_MODEL", "MODEL"],
+  }
+}
+
+/**
+ * Which of the three generic env fields this agent actually has a variable for.
+ *
+ * An empty list in {@link importantEnvKeysByAgent} means "this agent reads no
+ * env var for that slot" — Qoder, for instance, talks only to its own service
+ * and has no endpoint override. Rendering the input anyway offers a box whose
+ * value nothing will ever read, and (before `patchEnvByImportantKey` guarded
+ * it) wrote the typed value to an env var literally named `undefined`.
+ */
+export function importantFieldsFor(agentType: AgentType): {
+  apiBaseUrl: boolean
+  apiKey: boolean
+  model: boolean
+} {
+  const keys = importantEnvKeysByAgent(agentType)
+  return {
+    apiBaseUrl: keys.apiBaseUrl.length > 0,
+    apiKey: keys.apiKey.length > 0,
+    model: keys.model.length > 0,
   }
 }
 
@@ -1684,6 +1830,7 @@ interface CodexTomlImportantValues {
   providerSupportsWebsockets: Record<string, boolean>
   featureResponsesWebsocketsV2: boolean
   featureSkills: boolean
+  featureDefaultModeRequestUserInput: boolean
   serviceTierFast: boolean
 }
 
@@ -1696,10 +1843,34 @@ interface CodexImportantValues {
   providerOptions: string[]
   supportsWebsockets: boolean
   skills: boolean
+  defaultModeRequestUserInput: boolean
   serviceTierFast: boolean
 }
 
 const CODEX_DEFAULT_MODEL_PROVIDER = "codeg"
+
+/**
+ * `[features]` flag that lets codex call its `request_user_input` tool in the
+ * DEFAULT collaboration mode.
+ *
+ * Upstream, `ModeKind::allows_request_user_input()` is true for `Plan` only
+ * (codex-rs/protocol/src/config_types.rs), and
+ * `request_user_input_available_modes()` widens it to `Default` exactly when
+ * this feature is on (codex-rs/tools/src/tool_config.rs). Without it a
+ * default-mode turn that reaches for the tool is refused with
+ * "request_user_input is unavailable in Default mode" — i.e. codeg's question
+ * cards only ever appear in Plan mode (openai/codex#24750).
+ *
+ * Stage is `UnderDevelopment` and `default_enabled` is false
+ * (codex-rs/features/src/lib.rs), so it has no `/experimental` menu entry and
+ * config.toml is the only way to turn it on. Verified against codex-cli 0.147.0
+ * — the version codeg's pinned codex-acp 1.4.0 depends on — with
+ * `codex features list`: absent ⇒ false, `= true` ⇒ true. Unknown keys under
+ * `[features]` are ignored rather than rejected (also verified), so writing it
+ * is safe on a codex build that predates the flag.
+ */
+const CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY =
+  "default_mode_request_user_input"
 
 /**
  * Header codex reads to decide whether a provider authenticates through the
@@ -2062,33 +2233,35 @@ function extractCodexTomlImportantValues(
     CODEX_DEFAULT_REASONING_EFFORT
   let featureResponsesWebsocketsV2 = false
   let featureSkills = false
+  let featureDefaultModeRequestUserInput = false
   let serviceTierFast = false
   let currentProviderSection: string | null = null
   let inFeaturesSection = false
+  // Still above the first section header, i.e. in the implicit root table —
+  // the only place a dotted `features.x` key actually means `[features].x`.
+  let inRootTable = true
 
   for (const rawLine of configTomlText.split(/\r?\n/)) {
     const line = rawLine.trim()
     if (!line || line.startsWith("#")) continue
 
-    const sectionMatch = line.match(
-      /^\[\s*model_providers\.([A-Za-z0-9_-]+)\s*\]$/
-    )
-    if (sectionMatch) {
-      currentProviderSection = sectionMatch[1]
-      inFeaturesSection = false
-      if (currentProviderSection.trim()) {
-        providerNames.add(currentProviderSection.trim())
+    // Section tracking goes through the same header predicate the writer uses,
+    // so the two never disagree about where a table begins. A header carrying
+    // a trailing comment (`[features] # flags`) is a header.
+    const headerName = tomlSectionHeaderName(rawLine)
+    if (isTomlSectionHeader(rawLine)) {
+      inRootTable = false
+      const providerName = headerName?.match(
+        /^model_providers\.([A-Za-z0-9_-]+)$/
+      )?.[1]
+      if (providerName) {
+        currentProviderSection = providerName
+        inFeaturesSection = false
+        providerNames.add(providerName)
+      } else {
+        currentProviderSection = null
+        inFeaturesSection = headerName === "features"
       }
-      continue
-    }
-    if (line.match(/^\[\s*features\s*\]$/)) {
-      inFeaturesSection = true
-      currentProviderSection = null
-      continue
-    }
-    if (line.startsWith("[") && line.endsWith("]")) {
-      currentProviderSection = null
-      inFeaturesSection = false
       continue
     }
 
@@ -2140,6 +2313,13 @@ function extractCodexTomlImportantValues(
         featureSkills = boolAssignment.value
         continue
       }
+      if (
+        inFeaturesSection &&
+        boolAssignment.key === CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY
+      ) {
+        featureDefaultModeRequestUserInput = boolAssignment.value
+        continue
+      }
       const dottedProviderWebsocketMatch = boolAssignment.key.match(
         /^model_providers\.([A-Za-z0-9_-]+)\.supports_websockets$/
       )
@@ -2149,13 +2329,29 @@ function extractCodexTomlImportantValues(
         providerSupportsWebsockets[providerName] = boolAssignment.value
         continue
       }
-      if (boolAssignment.key === "features.responses_websockets_v2") {
-        featureResponsesWebsocketsV2 = boolAssignment.value
-        continue
-      }
-      if (boolAssignment.key === "features.skills") {
-        featureSkills = boolAssignment.value
-        continue
+      // The three dotted `features.*` spellings below are ROOT-scoped on
+      // purpose. Inside `[model_providers.codeg]` the same text means
+      // `model_providers.codeg.features.…` — a key codex ignores — and the
+      // writer only ever touches the root spelling. Reading a nested one would
+      // show a value no save could clear, and (for the websocket flag, which
+      // the writer re-derives on every patch) would promote a provider-local
+      // key into a global `[features]` flag behind the user's back.
+      if (inRootTable) {
+        if (boolAssignment.key === "features.responses_websockets_v2") {
+          featureResponsesWebsocketsV2 = boolAssignment.value
+          continue
+        }
+        if (boolAssignment.key === "features.skills") {
+          featureSkills = boolAssignment.value
+          continue
+        }
+        if (
+          boolAssignment.key ===
+          `features.${CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY}`
+        ) {
+          featureDefaultModeRequestUserInput = boolAssignment.value
+          continue
+        }
       }
     }
 
@@ -2204,6 +2400,7 @@ function extractCodexTomlImportantValues(
     providerSupportsWebsockets,
     featureResponsesWebsocketsV2,
     featureSkills,
+    featureDefaultModeRequestUserInput,
     serviceTierFast,
   }
 }
@@ -2272,7 +2469,10 @@ function hasCodexChatgptTokens(authJsonText: string): boolean {
   return false
 }
 
-function extractCodexImportantValues(
+/** Exported so tests can assert the reader and
+ * {@link patchCodexConfigTomlText} agree on every key — the two halves are what
+ * make a toggle round-trip through config.toml instead of snapping back. */
+export function extractCodexImportantValues(
   authJsonText: string,
   configTomlText: string
 ): CodexImportantValues {
@@ -2312,6 +2512,7 @@ function extractCodexImportantValues(
     ),
     supportsWebsockets: providerSupportsWebsockets,
     skills: toml.featureSkills,
+    defaultModeRequestUserInput: toml.featureDefaultModeRequestUserInput,
     serviceTierFast: toml.serviceTierFast,
   }
 }
@@ -2320,9 +2521,32 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
+/**
+ * Whether a line opens a new TOML table — `[table]` or `[[array]]` — allowing
+ * the trailing comment TOML permits after a header. Matching `[x]` exactly
+ * (what these helpers used to do) makes `[features] # flags` invisible, which
+ * is not a cosmetic miss: the scanner then keeps treating the lines below it as
+ * root-table keys, so an upsert appends a SECOND `[features]` and the file
+ * stops parsing.
+ */
+function isTomlSectionHeader(rawLine: string): boolean {
+  const line = rawLine.trim()
+  return line.startsWith("[") && /^\[.*\]\s*(?:#.*)?$/.test(line)
+}
+
+/**
+ * The table name from a `[table]` header, or null for anything else —
+ * including `[[array]]`, which is not a plain table. Surrounding whitespace is
+ * insignificant in TOML (`[ features ]` names `features`), so it is trimmed.
+ */
+function tomlSectionHeaderName(rawLine: string): string | null {
+  const match = rawLine.trim().match(/^\[([^[\]]*)\]\s*(?:#.*)?$/)
+  return match ? match[1].trim() : null
+}
+
 function findTomlRootEndIndex(lines: string[]): number {
   for (let i = 0; i < lines.length; i += 1) {
-    if (/^\[.*\]$/.test(lines[i].trim())) return i
+    if (isTomlSectionHeader(lines[i])) return i
   }
   return lines.length
 }
@@ -2398,18 +2622,16 @@ function findTomlSectionRange(
   lines: string[],
   sectionName: string
 ): { start: number; end: number } | null {
-  const headerText = `[${sectionName}]`
   let sectionStart = -1
   let sectionEnd = lines.length
   for (let i = 0; i < lines.length; i += 1) {
-    const trimmed = lines[i].trim()
     if (sectionStart < 0) {
-      if (trimmed === headerText) {
+      if (tomlSectionHeaderName(lines[i]) === sectionName) {
         sectionStart = i
       }
       continue
     }
-    if (/^\[.*\]$/.test(trimmed)) {
+    if (isTomlSectionHeader(lines[i])) {
       sectionEnd = i
       break
     }
@@ -2434,6 +2656,58 @@ function removeTomlSection(
   return lines.join("\n").trim()
 }
 
+/**
+ * Drop any ROOT-level `<section>.<key> = …` line — the dotted spelling of the
+ * very key this upsert is about to write into `[section]`.
+ *
+ * TOML treats `features.skills = true` and `[features]` + `skills = true` as
+ * the same key, but they cannot coexist: the dotted form defines the `features`
+ * table implicitly, so a later `[features]` header is a hard
+ * "trying to redefine an already defined table" parse error. Leaving the dotted
+ * line in place therefore breaks both directions — turning the switch OFF would
+ * not remove the value the reader still sees (the control snaps back), and
+ * turning it ON would emit a config.toml the backend refuses to persist.
+ *
+ * Only lines above the FIRST section header are considered: inside
+ * `[model_providers.codeg]`, `features.skills` means
+ * `model_providers.codeg.features.skills`, an unrelated key we must not touch.
+ */
+function stripRootDottedKey(
+  lines: string[],
+  sectionName: string,
+  key: string
+): void {
+  const dotted = `${sectionName}.${key}`
+  for (let i = 0; i < lines.length; i += 1) {
+    if (isTomlSectionHeader(lines[i])) return
+    if (parseTomlAssignmentKey(lines[i]) === dotted) {
+      lines.splice(i, 1)
+      i -= 1
+    }
+  }
+}
+
+/**
+ * Index of the last ROOT-level `<section>.…` dotted assignment, or -1.
+ *
+ * A surviving sibling means the root table already defines `[section]`
+ * implicitly, so emitting a `[section]` header would be a redefinition. Writing
+ * the new key in the same dotted spelling keeps the document valid and leaves
+ * the sibling — someone else's setting — exactly where the user put it.
+ */
+function lastRootDottedSiblingIndex(
+  lines: string[],
+  sectionName: string
+): number {
+  const prefix = `${sectionName}.`
+  let last = -1
+  for (let i = 0; i < lines.length; i += 1) {
+    if (isTomlSectionHeader(lines[i])) break
+    if (parseTomlAssignmentKey(lines[i])?.startsWith(prefix)) last = i
+  }
+  return last
+}
+
 function upsertTomlSectionBooleanKey(
   configTomlText: string,
   sectionName: string,
@@ -2441,6 +2715,7 @@ function upsertTomlSectionBooleanKey(
   value: boolean | null
 ): string {
   const lines = configTomlText.split(/\r?\n/)
+  stripRootDottedKey(lines, sectionName, key)
   const section = findTomlSectionRange(lines, sectionName)
 
   if (section) {
@@ -2500,11 +2775,25 @@ function upsertTomlSectionBooleanKey(
     return lines.join("\n").trim()
   }
 
+  // No `[section]` to edit. Removing is still not a no-op: a root-level dotted
+  // spelling of this key may have just been stripped above, and that IS the
+  // value the reader was showing.
   if (value === null) {
-    return configTomlText.trim()
+    return lines.join("\n").trim()
   }
 
   const lineText = `${key} = ${value ? "true" : "false"}`
+
+  // The root table may already define this section through a dotted sibling we
+  // must not touch (`features.skills = true` while we write
+  // `features.default_mode_request_user_input`). Join it in its own spelling
+  // rather than opening a header that would redefine the table.
+  const sibling = lastRootDottedSiblingIndex(lines, sectionName)
+  if (sibling >= 0) {
+    lines.splice(sibling + 1, 0, `${sectionName}.${lineText}`)
+    return lines.join("\n").trim()
+  }
+
   const insertAt = findTomlRootEndIndex(lines)
   const prefixBlank =
     insertAt > 0 && lines[insertAt - 1].trim() !== "" ? [""] : []
@@ -2807,6 +3096,7 @@ export function patchCodexConfigTomlText(
     modelReasoningEffort?: string
     supportsWebsockets?: boolean
     skills?: boolean
+    defaultModeRequestUserInput?: boolean
     serviceTierFast?: boolean
   }
 ): string {
@@ -2891,9 +3181,19 @@ export function patchCodexConfigTomlText(
   )
   const activeProvider =
     normalizedTomlValues.modelProvider.trim() || CODEX_DEFAULT_MODEL_PROVIDER
-  const shouldEnableFeature = Boolean(
-    normalizedTomlValues.providerSupportsWebsockets[activeProvider]
-  )
+  // This key is rewritten on EVERY patch, including ones that have nothing to
+  // do with WebSockets, so it must resolve the flag exactly the way
+  // `extractCodexImportantValues` does — including its fallback to the feature
+  // key itself when the provider declares no `supports_websockets`. Reading
+  // only the provider field would treat "declared solely as a feature flag" as
+  // "off" and delete the user's setting the next time any other control moved.
+  // `??` and not `||`: an explicit `false` on the provider must win over the
+  // fallback, which is how the WebSocket switch turns itself off.
+  const shouldEnableFeature =
+    normalizedTomlValues.providerSupportsWebsockets[activeProvider] ??
+    (activeProvider === CODEX_DEFAULT_MODEL_PROVIDER
+      ? normalizedTomlValues.featureResponsesWebsocketsV2
+      : false)
   nextTomlText = upsertTomlSectionBooleanKey(
     nextTomlText,
     "features",
@@ -2906,6 +3206,17 @@ export function patchCodexConfigTomlText(
       "features",
       "skills",
       patch.skills ? true : null
+    )
+  }
+  if (typeof patch.defaultModeRequestUserInput === "boolean") {
+    // Upstream default is false, so "off" removes the key instead of writing
+    // `= false` — same contract as `skills` above, and it keeps config.toml
+    // free of a flag the user never opted into.
+    nextTomlText = upsertTomlSectionBooleanKey(
+      nextTomlText,
+      "features",
+      CODEX_DEFAULT_MODE_REQUEST_USER_INPUT_KEY,
+      patch.defaultModeRequestUserInput ? true : null
     )
   }
   if (typeof patch.serviceTierFast === "boolean") {
@@ -3209,21 +3520,32 @@ export function materializeClaudeHardeningFlags(
   return { configText: nextConfig, envText: nextEnv }
 }
 
-function patchEnvByImportantKey(
+export function patchEnvByImportantKey(
   agentType: AgentType,
   envText: string,
   key: ImportantConfigKey,
   value: string
 ): string {
   const keys = importantEnvKeysByAgent(agentType)
+  // The FIRST key of each list is the one codeg writes; the rest are aliases it
+  // only reads. An agent that has no env var for a slot leaves that list empty,
+  // and `[0]` is then `undefined` — which `patchEnvText` would happily write as
+  // an env var literally named `undefined`, silently swallowing what the user
+  // typed. `writeKey` turns that into a no-op instead; the field is also hidden
+  // (see `importantFieldsFor`), so this is the belt to that suspenders.
+  const writeKey = (candidates: string[]): string | undefined => candidates[0]
+  const patch = (candidates: string[]): string => {
+    const target = writeKey(candidates)
+    return target ? patchEnvText(envText, { [target]: value }) : envText
+  }
   if (key === "apiBaseUrl") {
-    return patchEnvText(envText, { [keys.apiBaseUrl[0]]: value })
+    return patch(keys.apiBaseUrl)
   }
   if (key === "apiKey") {
-    return patchEnvText(envText, { [keys.apiKey[0]]: value })
+    return patch(keys.apiKey)
   }
   if (key === "model") {
-    return patchEnvText(envText, { [keys.model[0]]: value })
+    return patch(keys.model)
   }
   return patchEnvText(envText, { [CLAUDE_MODEL_ENV_KEYS[key]]: value })
 }
@@ -3455,6 +3777,8 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     codexReasoningEffort: codexImportant.reasoningEffort,
     codexSupportsWebsockets: codexImportant.supportsWebsockets,
     codexSkills: codexImportant.skills,
+    codexDefaultModeRequestUserInput:
+      codexImportant.defaultModeRequestUserInput,
     codexServiceTierFast: codexImportant.serviceTierFast,
     ...codexSandboxFields,
     codexSandboxBaseline: codexSandboxBaselineOf(codexSandboxFields),
@@ -3713,12 +4037,15 @@ export function buildVersionCheck(
 
   // Custom-version install is offered in every installable state (and stays
   // available after a version is installed, so users can switch versions).
-  // Binary agents need the registry version present to template the download URL.
-  // uvx agents pin their version in the package spec, so custom-version
-  // install does not apply (the backend ignores the override).
-  const supportsCustomInstall =
-    agent.distribution_type === "npx" ||
-    (agent.distribution_type === "binary" && Boolean(agent.registry_version))
+  //
+  // The backend decides, because the condition is a property of the download
+  // URL rather than of the distribution kind: a binary agent's custom install
+  // substitutes the requested version into the pinned URL, which only yields a
+  // different archive when the pinned version appears in it. Antigravity's URLs
+  // carry a Google build id, so inferring support from
+  // `binary && registry_version` — as this did — offered an install that
+  // downloaded the same bytes and cached them under the number the user typed.
+  const supportsCustomInstall = agent.supports_custom_version
   const customInstallFix: UiFixAction = {
     label: acpText("actions.customInstall", "Custom install"),
     kind: "custom_install",
@@ -4168,6 +4495,18 @@ export function AcpAgentSettings() {
         for (const agent of next) {
           if (!updated[agent.agent_type]) {
             updated[agent.agent_type] = buildAgentDraft(agent)
+            continue
+          }
+          // An EXISTING draft is deliberately kept (it may hold in-progress
+          // edits) — but for the keys a structured panel owns, keeping it is
+          // what loses data: the enable switch persists `draft.envText`
+          // wholesale, so a draft still holding this window's pre-refresh
+          // values would restore them over whatever another window (or
+          // another surface here) just saved. Rebase only those keys; every
+          // other key, and every unsaved edit to them, is untouched.
+          const existing = updated[agent.agent_type]
+          if (agent.agent_type === "deepseek" && existing) {
+            updated[agent.agent_type] = rebaseDeepSeekDraft(existing, agent)
           }
         }
         return updated
@@ -4387,7 +4726,11 @@ export function AcpAgentSettings() {
       agentType: AgentType,
       enabled: boolean,
       envText: string,
-      modelProviderId?: number | null
+      modelProviderId?: number | null,
+      /** The keys a STRUCTURED panel owns, when the env came from one rather
+       * than from `draft.envText`. `undefined` for a key deletes it. See the
+       * draft sync below. */
+      draftEnvPatch?: Record<string, string | undefined>
     ) => {
       const parsedEnv = parseEnvText(envText)
       setSavingEnv((prev) => ({ ...prev, [agentType]: true }))
@@ -4409,6 +4752,41 @@ export function AcpAgentSettings() {
               : agent
           )
         )
+        // A structured panel writes env the raw editor never sees, and the
+        // agents refetch deliberately preserves existing drafts (to protect
+        // in-progress edits). The enable switch persists `draft.envText`
+        // WHOLESALE, so a draft left holding pre-save text silently undoes the
+        // save the moment the user flips it. Fold the panel's keys into the
+        // draft — in the same commit as `setAgents`, so no await window exists
+        // in which the switch could fire with the old text, and no refetch
+        // failure can leave it stale.
+        //
+        // A PATCH, not a wholesale replace: the textarea stays editable while
+        // the panel's request is in flight, so overwriting the draft with the
+        // panel's own map would erase whatever was typed in the meantime.
+        if (draftEnvPatch) {
+          const keys = importantEnvKeysByAgent(agentType)
+          setDrafts((prev) => {
+            const current = prev[agentType]
+            if (!current) return prev
+            const envText = patchEnvText(current.envText, draftEnvPatch)
+            const mergedEnv = parseEnvText(envText)
+            return {
+              ...prev,
+              [agentType]: {
+                ...current,
+                enabled,
+                envText,
+                modelProviderId: modelProviderId ?? null,
+                // The structured mirrors read the same keys, so they have to
+                // move with the text or the two views disagree.
+                apiBaseUrl: findEnvValue(mergedEnv, keys.apiBaseUrl),
+                apiKey: findEnvValue(mergedEnv, keys.apiKey),
+                model: findEnvValue(mergedEnv, keys.model),
+              },
+            }
+          })
+        }
         reportAffectedSessions(affected)
       } finally {
         setSavingEnv((prev) => ({ ...prev, [agentType]: false }))
@@ -4547,21 +4925,26 @@ export function AcpAgentSettings() {
   // drafts (to preserve in-progress edits), so without this the collapsed raw
   // editor and the structured dropdowns could drift out of sync with disk (the
   // structured merge and the raw editor each write keys the other doesn't echo).
-  const reseedGrokDraft = useCallback(async () => {
+  const reseedAgentDraft = useCallback(async (agentType: AgentType) => {
     try {
       const fresh = await acpListAgents()
       setAgents(fresh)
       publishAgentDisplay(fresh)
-      const grok = fresh.find((a) => a.agent_type === "grok")
-      if (grok) {
-        setDrafts((prev) => ({ ...prev, grok: buildAgentDraft(grok) }))
+      const agent = fresh.find((a) => a.agent_type === agentType)
+      if (agent) {
+        setDrafts((prev) => ({ ...prev, [agentType]: buildAgentDraft(agent) }))
       }
     } catch (err) {
       // Non-fatal: the save already committed, and the agents-updated
       // subscription will resync shortly — never surface this as a save failure.
-      console.error("[Settings] reseed grok draft failed:", err)
+      console.error(`[Settings] reseed ${agentType} draft failed:`, err)
     }
   }, [])
+
+  const reseedGrokDraft = useCallback(
+    () => reseedAgentDraft("grok"),
+    [reseedAgentDraft]
+  )
 
   const runBinaryAction = useCallback(
     async (
@@ -7001,6 +7384,7 @@ export function AcpAgentSettings() {
         codexReasoningEffort: important.reasoningEffort,
         codexSupportsWebsockets: important.supportsWebsockets,
         codexSkills: important.skills,
+        codexDefaultModeRequestUserInput: important.defaultModeRequestUserInput,
         codexServiceTierFast: important.serviceTierFast,
       }))
     },
@@ -7054,6 +7438,7 @@ export function AcpAgentSettings() {
           codexReasoningEffort: synced.reasoningEffort,
           codexSupportsWebsockets: synced.supportsWebsockets,
           codexSkills: synced.skills,
+          codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
           codexServiceTierFast: synced.serviceTierFast,
         }))
         return
@@ -7088,6 +7473,7 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
       }))
     },
@@ -7182,6 +7568,7 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexAuthJsonText: nextAuth.authJsonText,
         codexConfigTomlText: nextToml,
@@ -7219,6 +7606,7 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
@@ -7252,6 +7640,41 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
+        codexServiceTierFast: synced.serviceTierFast,
+        codexConfigTomlText: nextToml,
+      }))
+    },
+    [selectedAgent, selectedDraft, updateSelectedDraft]
+  )
+
+  const handleCodexDefaultModeRequestUserInputChange = useCallback(
+    (enabled: boolean) => {
+      if (
+        !selectedAgent ||
+        !selectedDraft ||
+        selectedAgent.agent_type !== "codex"
+      )
+        return
+      const nextToml = patchCodexConfigTomlText(
+        selectedDraft.codexConfigTomlText,
+        { defaultModeRequestUserInput: enabled }
+      )
+      const synced = extractCodexImportantValues(
+        selectedDraft.codexAuthJsonText,
+        nextToml
+      )
+      updateSelectedDraft((current) => ({
+        ...current,
+        apiBaseUrl: synced.apiBaseUrl,
+        apiKey: synced.apiKey ?? current.apiKey,
+        model: synced.model,
+        codexModelProvider: synced.modelProvider,
+        codexProviderOptions: synced.providerOptions,
+        codexReasoningEffort: synced.reasoningEffort,
+        codexSupportsWebsockets: synced.supportsWebsockets,
+        codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
@@ -7285,6 +7708,7 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
+        codexDefaultModeRequestUserInput: synced.defaultModeRequestUserInput,
         codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
@@ -8215,6 +8639,32 @@ export function AcpAgentSettings() {
                           aria-label={t("codex.enableSkillsAria")}
                         />
                       </div>
+                    </div>
+
+                    {/* `[features].default_mode_request_user_input` — without
+                        it codex refuses its own `request_user_input` tool
+                        outside Plan mode, so codeg's question cards never
+                        appear in an ordinary turn (openai/codex#24750). */}
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("codex.enableDefaultModeRequestUserInput")}
+                        </label>
+                        <Switch
+                          checked={
+                            selectedDraft.codexDefaultModeRequestUserInput
+                          }
+                          onCheckedChange={
+                            handleCodexDefaultModeRequestUserInputChange
+                          }
+                          aria-label={t(
+                            "codex.enableDefaultModeRequestUserInputAria"
+                          )}
+                        />
+                      </div>
+                      <p className="text-[10px] text-muted-foreground">
+                        {t("codex.enableDefaultModeRequestUserInputHint")}
+                      </p>
                     </div>
 
                     <div className="space-y-1.5">
@@ -10527,6 +10977,81 @@ supports_websockets = true`}
                     onSaved={refreshAgents}
                     onAffectedSessions={reportAffectedSessions}
                   />
+                ) : selectedAgent.agent_type === "deepseek" ? (
+                  <DeepSeekConfigPanel
+                    agent={selectedAgent}
+                    saving={Boolean(savingEnv[selectedAgent.agent_type])}
+                    onSaveEnv={(env, enabled) =>
+                      persistEnv(
+                        selectedAgent.agent_type,
+                        enabled,
+                        envMapToText(env),
+                        selectedAgent.model_provider_id,
+                        // The keys this panel owns, folded into the raw
+                        // editor's draft (which the enable switch persists
+                        // wholesale) so the two can never disagree.
+                        // `DEEPSEEK_ACP_MODEL` is NOT one of them — the raw
+                        // editor owns it, and folding it in would overwrite a
+                        // model line being typed there.
+                        {
+                          DEEPSEEK_API_KEY: env.DEEPSEEK_API_KEY,
+                          DEEPSEEK_BASE_URL: env.DEEPSEEK_BASE_URL,
+                          DEEPSEEK_ACP_PROVIDER: env.DEEPSEEK_ACP_PROVIDER,
+                        }
+                      )
+                    }
+                  />
+                ) : selectedAgent.agent_type === "qoder" ? (
+                  <QoderConfigPanel
+                    agent={selectedAgent}
+                    saving={Boolean(savingEnv[selectedAgent.agent_type])}
+                    onSaveEnv={(env, enabled) =>
+                      persistEnv(
+                        selectedAgent.agent_type,
+                        enabled,
+                        envMapToText(env),
+                        selectedAgent.model_provider_id,
+                        // The one key this panel owns, folded into the raw
+                        // editor's draft. That draft is persisted WHOLESALE by
+                        // the enable switch and the generic env Save button, so
+                        // without this a saved token would be silently deleted
+                        // the moment either one fires. `undefined` (the token
+                        // field was cleared) deletes the line, which is the
+                        // outcome clearing it asks for.
+                        {
+                          QODER_PERSONAL_ACCESS_TOKEN:
+                            env.QODER_PERSONAL_ACCESS_TOKEN,
+                        }
+                      )
+                    }
+                    onSaved={refreshAgents}
+                    onAffectedSessions={reportAffectedSessions}
+                  />
+                ) : selectedAgent.agent_type === "antigravity" ? (
+                  <AntigravityConfigPanel
+                    agent={selectedAgent}
+                    saving={Boolean(savingEnv[selectedAgent.agent_type])}
+                    onSaveEnv={(env, enabled) =>
+                      persistEnv(
+                        selectedAgent.agent_type,
+                        enabled,
+                        envMapToText(env),
+                        selectedAgent.model_provider_id,
+                        // The keys this panel owns, folded into the raw
+                        // editor's draft. That draft is persisted WHOLESALE by
+                        // the enable switch and the generic env Save button, so
+                        // without this a saved auth method would be silently
+                        // deleted the moment either one fires. `undefined` (the
+                        // method does not use that credential) deletes the
+                        // line, which is exactly what switching methods asks
+                        // for.
+                        Object.fromEntries(
+                          ANTIGRAVITY_ENV_KEYS.map((key) => [key, env[key]])
+                        )
+                      )
+                    }
+                    onSaved={refreshAgents}
+                  />
                 ) : selectedAgent.agent_type === "grok" ? (
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
                     <div>
@@ -11262,38 +11787,14 @@ supports_websockets = true`}
                       selectedDraft.claudeAuthMode === "custom" ||
                       selectedDraft.claudeAuthMode === "model_provider") && (
                       <>
-                        <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
-                            API URL
-                          </label>
-                          <Input
-                            value={selectedDraft.apiBaseUrl}
-                            readOnly={
-                              selectedAgent.agent_type === "claude_code" &&
-                              selectedDraft.claudeAuthMode === "model_provider"
-                            }
-                            onChange={(event) => {
-                              handleImportantConfigChange(
-                                "apiBaseUrl",
-                                event.target.value
-                              )
-                            }}
-                            placeholder="https://api.example.com"
-                          />
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
-                            API Key
-                          </label>
-                          <div className="flex items-center gap-2">
+                        {importantFieldsFor(selectedAgent.agent_type)
+                          .apiBaseUrl && (
+                          <div className="space-y-1.5">
+                            <label className="text-[11px] text-muted-foreground">
+                              API URL
+                            </label>
                             <Input
-                              type={
-                                showApiKeys[selectedAgent.agent_type]
-                                  ? "text"
-                                  : "password"
-                              }
-                              value={selectedDraft.apiKey}
+                              value={selectedDraft.apiBaseUrl}
                               readOnly={
                                 selectedAgent.agent_type === "claude_code" &&
                                 selectedDraft.claudeAuthMode ===
@@ -11301,37 +11802,68 @@ supports_websockets = true`}
                               }
                               onChange={(event) => {
                                 handleImportantConfigChange(
-                                  "apiKey",
+                                  "apiBaseUrl",
                                   event.target.value
                                 )
                               }}
-                              placeholder="sk-..."
+                              placeholder="https://api.example.com"
                             />
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                setShowApiKeys((prev) => ({
-                                  ...prev,
-                                  [selectedAgent.agent_type]:
-                                    !prev[selectedAgent.agent_type],
-                                }))
-                              }}
-                              title={
-                                showApiKeys[selectedAgent.agent_type]
-                                  ? t("actions.hideApiKey")
-                                  : t("actions.showApiKey")
-                              }
-                            >
-                              {showApiKeys[selectedAgent.agent_type] ? (
-                                <EyeOff className="h-3.5 w-3.5" />
-                              ) : (
-                                <Eye className="h-3.5 w-3.5" />
-                              )}
-                            </Button>
                           </div>
-                        </div>
+                        )}
+
+                        {importantFieldsFor(selectedAgent.agent_type)
+                          .apiKey && (
+                          <div className="space-y-1.5">
+                            <label className="text-[11px] text-muted-foreground">
+                              API Key
+                            </label>
+                            <div className="flex items-center gap-2">
+                              <Input
+                                type={
+                                  showApiKeys[selectedAgent.agent_type]
+                                    ? "text"
+                                    : "password"
+                                }
+                                value={selectedDraft.apiKey}
+                                readOnly={
+                                  selectedAgent.agent_type === "claude_code" &&
+                                  selectedDraft.claudeAuthMode ===
+                                    "model_provider"
+                                }
+                                onChange={(event) => {
+                                  handleImportantConfigChange(
+                                    "apiKey",
+                                    event.target.value
+                                  )
+                                }}
+                                placeholder="sk-..."
+                              />
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  setShowApiKeys((prev) => ({
+                                    ...prev,
+                                    [selectedAgent.agent_type]:
+                                      !prev[selectedAgent.agent_type],
+                                  }))
+                                }}
+                                title={
+                                  showApiKeys[selectedAgent.agent_type]
+                                    ? t("actions.hideApiKey")
+                                    : t("actions.showApiKey")
+                                }
+                              >
+                                {showApiKeys[selectedAgent.agent_type] ? (
+                                  <EyeOff className="h-3.5 w-3.5" />
+                                ) : (
+                                  <Eye className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            </div>
+                          </div>
+                        )}
                       </>
                     )}
 
@@ -11580,22 +12112,24 @@ supports_websockets = true`}
                         </div>
                       </div>
                     ) : (
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          Model
-                        </label>
-                        <Input
-                          value={selectedDraft.model}
-                          readOnly={selectedDraft.modelProviderId != null}
-                          onChange={(event) => {
-                            handleImportantConfigChange(
-                              "model",
-                              event.target.value
-                            )
-                          }}
-                          placeholder="gpt-5 / claude-sonnet / gemini-2.5-pro"
-                        />
-                      </div>
+                      importantFieldsFor(selectedAgent.agent_type).model && (
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            Model
+                          </label>
+                          <Input
+                            value={selectedDraft.model}
+                            readOnly={selectedDraft.modelProviderId != null}
+                            onChange={(event) => {
+                              handleImportantConfigChange(
+                                "model",
+                                event.target.value
+                              )
+                            }}
+                            placeholder="gpt-5 / claude-sonnet / gemini-2.5-pro"
+                          />
+                        </div>
+                      )
                     )}
 
                     <div className="space-y-1.5">

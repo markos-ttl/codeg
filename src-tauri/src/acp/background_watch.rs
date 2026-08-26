@@ -37,13 +37,23 @@
 //!   consumed exactly once, so a cron//loop re-fire of the SAME text later
 //!   correctly classifies as out-of-turn).
 //!
+//! * **Session title** — Claude Code's generated name arrives as a dedicated
+//!   `ai-title` transcript record whenever the background summarizer finishes,
+//!   routinely AFTER the turn that triggered it ended. The ACP adapter only
+//!   pulls the name at turn-end (`maybeUpdateSessionTitle`, claude-agent-acp
+//!   0.69.0), so on a short session there is nothing to read yet and no wire
+//!   event ever follows. These bytes are already being tailed, so the records
+//!   are folded here and handed to [`publish_native_title`] — the same path a
+//!   live ACP title takes. Not activity: it rides alongside the activity event
+//!   rather than inside it (see `run_watch`).
+//!
 //! The watcher is connection-scoped on purpose: background work cannot outlive
 //! the agent CLI process, whose lifetime IS the connection's. Poll ticks are
 //! mtime-gated (an unchanged file costs one `stat`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,14 +61,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::acp::session_state::{background_keepalive_max_age, SessionState};
+use crate::acp::session_title::publish_native_title;
 use crate::acp::types::{AcpEvent, BackgroundSettledInfo, ConnectionStatus};
 use crate::models::agent::AgentType;
 use crate::models::message::MessageTurn;
 use crate::parsers::claude::{
-    capture_tag, find_session_file, group_into_turns, is_meta_message, slash_command_display,
-    task_notification_result_regex, task_notification_status_regex, task_notification_summary_regex,
-    task_notification_task_id_regex, task_notification_tool_use_id_regex, ClaudeRecordAccumulator,
-    BACKGROUND_RESULT_MAX_CHARS, CONTEXT_CONTINUATION_PREFIX,
+    capture_tag, capture_title_record, find_session_file, group_into_turns, is_meta_message,
+    slash_command_display, task_notification_result_regex, task_notification_status_regex,
+    task_notification_summary_regex, task_notification_task_id_regex,
+    task_notification_tool_use_id_regex, ClaudeRecordAccumulator, BACKGROUND_RESULT_MAX_CHARS,
+    CONTEXT_CONTINUATION_PREFIX,
 };
 use crate::parsers::truncate_str;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -232,7 +244,7 @@ async fn run_watch(
     // to account, classify, and ledger-consume. A RESUMED session's history
     // predates this instant and is skipped. Baselining blindly at EOF on
     // first discovery used to drop that pre-discovery window: the ack never
-    // registered (no keep-alive/chip) and the first prompt's ledger entry
+    // registered (no keep-alive) and the first prompt's ledger entry
     // lingered, able to swallow a later same-text cron refire.
     let spawn_epoch = std::time::SystemTime::now();
     let mut first_arm_done = false;
@@ -302,6 +314,31 @@ async fn run_watch(
                 continue;
             }
         };
+
+        // Publish a title the transcript just named the session, exactly like
+        // a live ACP one (same skip-cache, same lifecycle write). Deliberately
+        // OUTSIDE the activity emit below: a tick whose tail is nothing but an
+        // `ai-title` record produces no turns, no settlements and no
+        // accounting change, so `tick` correctly returns `None` — which is the
+        // common case for a title generated after the last turn ended.
+        //
+        // Held rather than dropped while the conversation row is still
+        // unbound: unlike a live ACP title there is no resend to COUNT on.
+        // These bytes are read exactly once, and while the CLI does re-emit the
+        // record on its own metadata flushes, nothing guarantees another one
+        // lands after the row binds — a session that ends right there would
+        // keep its first-prompt name.
+        //
+        // Bound to a `let` so the read guard is released before
+        // `publish_native_title` asks for the write lock, and short-circuited
+        // on `pending_title` so a settled session never takes the lock at all.
+        let title_is_publishable =
+            ws.pending_title.is_some() && state.read().await.conversation_id.is_some();
+        if title_is_publishable {
+            if let Some(title) = ws.pending_title.take() {
+                publish_native_title(&state, &emitter, title).await;
+            }
+        }
 
         if let Some(event) = event {
             if let AcpEvent::BackgroundActivity {
@@ -399,6 +436,33 @@ pub(crate) struct WatchState {
     /// `Prompting` state observed at the previous tick — the edge detector for
     /// `current_turn_launched_ids` above.
     was_prompting: bool,
+    /// A codeg-sent prompt has been matched in the transcript and the model has
+    /// not answered it yet. Within that window the CLI writes the rest of the
+    /// SUBMISSION — a slash command's `<local-command-stdout>`, the `isMeta`
+    /// instruction `/goal` injects for the model, image metadata — and
+    /// `turn_initiator_text` reads those as fresh initiators (they are user
+    /// records with text, and the ledger has nothing left to match them
+    /// against). Flipping to `Background` there re-renders the wire's own reply
+    /// as an overlay: the observed `/goal` bug, where the whole answer appeared
+    /// twice.
+    ///
+    /// Four things bound it, because a swallowed initiator is worse than a
+    /// duplicate (a duplicate self-heals on the next detail refetch; a turn that
+    /// never reaches the overlay is missing from the LIVE view until then):
+    /// only records carrying the matched prompt's own `promptId` are affected
+    /// (`foreground_submission_id` — a submission id is per-submission, so an
+    /// autonomous prompt always has a different one, or none); the model's first
+    /// record closes the window; any non-prompting tick closes it (so a turn
+    /// that ends without ever answering cannot strand it); and a
+    /// `<task-notification>` is exempt outright — it settles on its own schedule
+    /// and its follow-up has no other live place to render.
+    foreground_awaiting_reply: bool,
+    /// `promptId` of the ledger-matched record that opened the window above.
+    /// `None` when that record carried none, which disables the window entirely
+    /// — without an id there is no way to tell a submission's own records from
+    /// an unrelated initiator, and the safe failure is the pre-fix duplicate,
+    /// never a hidden turn.
+    foreground_submission_id: Option<String>,
     /// `Prompting` state for the tick currently being processed. Set once at
     /// `tick()` entry from the caller-supplied snapshot so `account()` (called
     /// per transcript line within the same tick) can read it without an extra
@@ -424,6 +488,23 @@ pub(crate) struct WatchState {
     /// they were written before the transcript file was first discovered;
     /// records before it are pre-existing history. Set by `rearm`.
     epoch: Option<std::time::SystemTime>,
+    /// Newest non-empty `custom-title` / `ai-title` value this watch has read
+    /// off the transcript, in the parser's own two slots (`parsers::claude::
+    /// capture_title_record`). Kept separate rather than folded into one
+    /// string so the user's `/rename` keeps winning over a title Claude Code
+    /// generates afterwards, exactly as `parse_conversation_detail` resolves
+    /// the pair over the whole file.
+    ///
+    /// Seeded from the skipped pre-baseline history at arm time
+    /// (`seed_titles_from_history`) precisely because that resolution IS a
+    /// whole-file rule — the two records are appended independently, so the
+    /// tail alone is not enough to resolve them.
+    custom_title: Option<String>,
+    ai_title: Option<String>,
+    /// A resolved title this watch read but has not published yet. Set only
+    /// when a title RECORD actually changed the resolution, so a session with
+    /// a settled name costs nothing per tick.
+    pending_title: Option<String>,
 }
 
 impl WatchState {
@@ -440,6 +521,8 @@ impl WatchState {
             settled_ids: HashSet::new(),
             current_turn_launched_ids: HashSet::new(),
             was_prompting: false,
+            foreground_awaiting_reply: false,
+            foreground_submission_id: None,
             currently_prompting: false,
             turn_origin_task_ids: HashMap::new(),
             last_disk_activity: None,
@@ -450,6 +533,45 @@ impl WatchState {
             armed_logged: false,
             last_episode_base: 0,
             epoch: None,
+            custom_title: None,
+            ai_title: None,
+            pending_title: None,
+        }
+    }
+
+    /// The session's name as this watch currently understands it: the user's
+    /// own `/rename` first, then Claude Code's generated summary — the same
+    /// precedence `parsers::claude` applies when it resolves the whole file.
+    fn resolved_title(&self) -> Option<String> {
+        self.custom_title.clone().or_else(|| self.ai_title.clone())
+    }
+
+    /// Fold one transcript record into the title slots, queueing the result
+    /// for publication when it changed the resolved name.
+    ///
+    /// Claude Code writes its generated title as a dedicated `ai-title`
+    /// record, and it lands whenever the background summarizer finishes —
+    /// routinely AFTER the turn that triggered it has already ended. The ACP
+    /// adapter only reads the name back at turn-end, so on a short session
+    /// that title is never published and the conversation keeps its
+    /// first-prompt fallback name. The watcher is already tailing these exact
+    /// bytes, so surfacing the record here is what makes the name appear
+    /// while the session is still live instead of on its next detail load.
+    ///
+    /// Only records that carry a title are inspected — everything else costs
+    /// one string compare.
+    fn capture_title(&mut self, value: &serde_json::Value) {
+        let record_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !matches!(record_type, "custom-title" | "ai-title") {
+            return;
+        }
+        let before = self.resolved_title();
+        capture_title_record(value, record_type, &mut self.custom_title, &mut self.ai_title);
+        let after = self.resolved_title();
+        // `capture_title_record` ignores blank values, so `after` is `None`
+        // only when nothing has ever been captured — never a clear.
+        if after.is_some() && after != before {
+            self.pending_title = after;
         }
     }
 
@@ -527,6 +649,21 @@ impl WatchState {
         }
         if !is_prompting && self.was_prompting && turn_ended_abnormally {
             self.current_turn_launched_ids.clear();
+        }
+        // Not prompting ⇒ no submission is in flight, so the window is closed.
+        // Deliberately a LEVEL check, not the falling edge the launched-ids use:
+        // an edge can be missed entirely (a whole turn can start and finish
+        // between two polls, and this tick's own lines can re-open the window
+        // AFTER the edge was handled), which would strand the flag set with no
+        // later edge to clear it — and a stranded flag swallows the next
+        // genuinely autonomous initiator. The level check cannot strand.
+        // Re-arming within the same tick is still correct: the flag is set by
+        // the LEDGER MATCH in the line loop below, not by this snapshot, so a
+        // turn read entirely after it ended still classifies exactly as it did
+        // live. And since the first `!is_prompting` observation is the falling
+        // edge, this adds no new exposure to the snapshot's race with the wire.
+        if !is_prompting {
+            self.foreground_awaiting_reply = false;
         }
         self.was_prompting = is_prompting;
         self.currently_prompting = is_prompting;
@@ -612,6 +749,7 @@ impl WatchState {
                             Err(_) => continue,
                         };
                         self.account(&value, &mut settled);
+                        self.capture_title(&value);
                         self.classify_and_feed(&value, ledger, cwd, &mut changed_turns);
                     }
                     if !lines.is_empty() {
@@ -656,23 +794,11 @@ impl WatchState {
         // existing card in-memory from this payload (`resolveBackgroundTask`)
         // rather than issuing the `refetchDetail` it used to — see §3.2.
         // `outstanding`/`watermark` are computed independently and untouched by
-        // this filter, so the sweep-exemption/chip accounting stays accurate.
-        //
-        // Instead of dropping a held-turn settle we TAG it: `wire_visible` marks
-        // a settle whose task belongs to a turn #870 is holding open (its id is
-        // still in `current_turn_launched_ids`), so its reply is already on the
-        // wire. The frontend reads this to skip arming the "syncing results"
-        // hint for such a settle (there's no gap to bridge) — a backend-derived
-        // classification, correct even when this tick reads the settlement after
-        // the turn already fell back to `Connected` (the set isn't cleared until
-        // the next rising edge).
+        // this filter, so the sweep-exemption accounting stays accurate.
         changed_turns.retain(|t| {
             let origin = self.turn_origin_task_ids.remove(&t.id).flatten();
             !matches!(origin, Some(task_id) if self.current_turn_launched_ids.contains(&task_id))
         });
-        for s in settled.iter_mut() {
-            s.wire_visible = self.current_turn_launched_ids.contains(&s.task_id);
-        }
 
         let outstanding = self.tasks.len() as u32;
         let accounting_changed =
@@ -709,8 +835,63 @@ impl WatchState {
             // must see this tick as changed so a baseline that landed BEFORE
             // EOF (pre-discovery records to process) is read immediately, not
             // on the next unrelated append.
+            self.seed_titles_from_history(&f, self.committed);
         }
         self.file = Some(f);
+    }
+
+    /// Fold the title records in the SKIPPED history into the title slots,
+    /// without queueing any of them for publication.
+    ///
+    /// `customTitle ?? aiTitle` is a WHOLE-FILE rule, and Claude Code appends
+    /// the two records INDEPENDENTLY: `/rename` writes a lone `custom-title`,
+    /// the background summarizer writes a lone `ai-title` (verified in the
+    /// 2.1.185 CLI — two separate one-record writers, plus a metadata flush
+    /// that re-emits whichever are set). A session renamed before this watch
+    /// armed therefore keeps its `custom-title` entirely in the history the
+    /// baseline skips, and resolving over the tail alone would let the next
+    /// `ai-title` publish over the user's own name — which the CLI re-emits
+    /// constantly (228 identical copies in one observed transcript), so the
+    /// exposure is not theoretical. Seeding costs one bounded read of the
+    /// prefix, once per arm, on top of the whole-file read
+    /// `baseline_offset_since` just did.
+    ///
+    /// `pending_title` is deliberately untouched: history renders through the
+    /// ordinary detail fetch, which already resolved this same pair over these
+    /// same bytes, so re-publishing it would rename on every reconnect.
+    fn seed_titles_from_history(&mut self, path: &PathBuf, upto: u64) {
+        if upto == 0 {
+            return;
+        }
+        let Ok(file) = std::fs::File::open(path) else {
+            return;
+        };
+        let mut reader = std::io::BufReader::new(file.take(upto));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // Mirror the tail reader: a non-UTF-8 (or unparsable) line is
+            // skipped, never fatal to the rest of the scan.
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim_end()) else {
+                continue;
+            };
+            let Some(record_type) = value.get("type").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            capture_title_record(
+                &value,
+                record_type,
+                &mut self.custom_title,
+                &mut self.ai_title,
+            );
+        }
     }
 
     /// Read bytes appended since `committed`, returning COMPLETE lines only;
@@ -869,9 +1050,6 @@ impl WatchState {
                                 summary,
                                 tool_use_id,
                                 result,
-                                // Set in `tick()` from `current_turn_launched_ids`
-                                // once the whole batch has been read.
-                                wire_visible: false,
                             });
                         }
                     }
@@ -957,6 +1135,12 @@ impl WatchState {
         cwd: &str,
         changed_turns: &mut Vec<MessageTurn>,
     ) {
+        // The model has started answering the matched prompt: the rest of the
+        // transcript is fair game for out-of-turn classification again.
+        if value.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+            self.foreground_awaiting_reply = false;
+        }
+
         if let Some(initiator_text) = turn_initiator_text(value) {
             if ledger.consume_matching(&initiator_text) {
                 // A codeg-sent prompt: the wire renders this turn. Close any
@@ -965,6 +1149,28 @@ impl WatchState {
                 self.collect_changed_turns(cwd, changed_turns);
                 self.episode = None;
                 self.mode = Mode::Foreground;
+                self.foreground_awaiting_reply = true;
+                self.foreground_submission_id = record_submission_id(value);
+                return;
+            }
+            // A `<task-notification>` is never part of a submission: it is
+            // background work settling on its own schedule, and the episode it
+            // opens is the only place its follow-up can render (the wire never
+            // carries it). It must classify out-of-turn even inside the window
+            // — the one initiator the window may not swallow.
+            if self.foreground_awaiting_reply
+                && self.foreground_submission_id.is_some()
+                && record_submission_id(value) == self.foreground_submission_id
+                && task_notification_origin_id(&initiator_text).is_none()
+            {
+                // Still inside the matched prompt's own submission — command
+                // output, the instruction `/goal` injects, image metadata. None
+                // of it starts a turn; the wire is rendering the one it belongs
+                // to. See `foreground_awaiting_reply`.
+                tracing::debug!(
+                    "[bg-watch] submission record before the reply, staying foreground: {:?}",
+                    initiator_text.chars().take(60).collect::<String>()
+                );
                 return;
             }
             tracing::debug!(
@@ -1143,6 +1349,20 @@ fn turn_initiator_text(value: &serde_json::Value) -> Option<String> {
         return None;
     }
     Some(text)
+}
+
+/// The submission a record belongs to. Claude Code stamps every user record it
+/// writes while composing and running ONE prompt with that prompt's `promptId`
+/// (verified across real transcripts: 13 prompts in a session carried 10
+/// distinct ids, repeating only across a prompt's own interrupt/retry), so it is
+/// the only reliable way to tell a submission's side records — command output,
+/// the instruction `/goal` injects — from an unrelated initiator.
+fn record_submission_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("promptId")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// If `text` (an out-of-turn initiator from `turn_initiator_text`) is a
@@ -1335,6 +1555,17 @@ mod tests {
         format!(
             r#"{{"type":"user","timestamp":"2026-07-07T03:49:00.000Z","uuid":"u-cron","isMeta":true,"userType":"external","message":{{"role":"user","content":"{text}"}}}}"#
         )
+    }
+
+    /// Real-shape generated-title record. Claude Code writes it with NO
+    /// timestamp and no message body (captured from a live transcript).
+    fn ai_title(title: &str) -> String {
+        format!(r#"{{"type":"ai-title","aiTitle":"{title}","sessionId":"s1"}}"#)
+    }
+
+    /// Real-shape user-set title record (`/rename`, `claude -n`, a fork).
+    fn custom_title(title: &str) -> String {
+        format!(r#"{{"type":"custom-title","customTitle":"{title}","sessionId":"s1"}}"#)
     }
 
     fn tick_now(ws: &mut WatchState, ledger: &PromptLedger) -> Option<AcpEvent> {
@@ -1669,6 +1900,177 @@ mod tests {
         );
     }
 
+    /// A slash command sent from codeg writes MORE than its own record: the
+    /// command, then `<local-command-stdout>`, then (for `/goal`) the `isMeta`
+    /// STRING instruction Claude Code injects for the model — and only then the
+    /// reply. Those side records are user records carrying text, so
+    /// `turn_initiator_text` reads them as initiators and the ledger, already
+    /// emptied by the command itself, has nothing to match them against. That
+    /// flipped the watcher to Background mid-turn and the wire-rendered reply
+    /// came back as an overlay copy — the reported `/goal` bug, where the whole
+    /// answer rendered twice while streaming.
+    #[test]
+    fn a_commands_own_side_records_do_not_reopen_the_turn_as_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        let ledger = PromptLedger::shared();
+        ledger.record_text("/goal build a test page");
+
+        let mut ws = WatchState::new();
+        ws.session_id = Some("s1".into());
+        ws.epoch = Some(epoch("2020-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+
+        let command = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.000Z","uuid":"u-cmd","promptId":"p1","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>build a test page</command-args>"}}"#;
+        let stdout = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.100Z","uuid":"u-out","promptId":"p1","message":{"role":"user","content":"<local-command-stdout>Goal set: build a test page</local-command-stdout>"}}"#;
+        let hook = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.200Z","uuid":"u-hook","promptId":"p1","isMeta":true,"userType":"external","message":{"role":"user","content":"A session-scoped Stop hook is now active with condition: build a test page."}}"#;
+        write_lines(
+            &path,
+            &[command, stdout, hook, &assistant_text("a1", "On it.")],
+        );
+        let event = tick_prompting(&mut ws, &ledger);
+        assert!(
+            event.is_none() || unpack(event.unwrap()).0.is_empty(),
+            "the wire renders this turn — its own submission records must not \
+             surface an overlay copy of the reply"
+        );
+
+        // The window closes at the model's first record, not at the turn's end:
+        // a genuinely autonomous initiator arriving after it still surfaces,
+        // even though the connection is STILL prompting.
+        write_lines(
+            &path,
+            &[
+                &cron_prompt("keep going"),
+                &assistant_text("a2", "resuming"),
+            ],
+        );
+        let (turns, ..) =
+            unpack(tick_prompting(&mut ws, &ledger).expect("turns event"));
+        assert!(
+            !turns.is_empty(),
+            "an autonomous initiator after the reply is out-of-turn as before"
+        );
+    }
+
+    /// The window is scoped by SUBMISSION, not by time: an autonomous prompt
+    /// that lands in the same interval — after the ledger match, before the
+    /// model's first record — carries a different `promptId` and must still
+    /// open its episode. Without this the fix would trade a recoverable
+    /// duplicate for a turn missing from the live view.
+    #[test]
+    fn a_foreign_submission_inside_the_window_still_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        let ledger = PromptLedger::shared();
+        ledger.record_text("/goal build a test page");
+
+        let mut ws = WatchState::new();
+        ws.session_id = Some("s1".into());
+        ws.epoch = Some(epoch("2020-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+
+        let command = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.000Z","uuid":"u-cmd","promptId":"p1","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>build a test page</command-args>"}}"#;
+        // Same shape as the hook injection above, foreign submission id.
+        let cron = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.200Z","uuid":"u-cron2","promptId":"p2","isMeta":true,"userType":"external","message":{"role":"user","content":"iterate forever"}}"#;
+        write_lines(
+            &path,
+            &[command, cron, &assistant_text("a1", "Working on it.")],
+        );
+        let (turns, ..) =
+            unpack(tick_prompting(&mut ws, &ledger).expect("turns event"));
+        assert!(
+            !turns.is_empty(),
+            "a different submission is not this one's side record"
+        );
+    }
+
+    /// The other initiator the window may not swallow: an async sub-agent's
+    /// `<task-notification>`. It settles on its own schedule and IS stamped with
+    /// the in-flight submission's `promptId`, so only the explicit exemption
+    /// keeps it out-of-turn. Its follow-up has no other live rendering path —
+    /// the wire never carries it — so suppressing it would lose the turn until
+    /// the next detail refetch.
+    #[test]
+    fn a_task_notification_inside_the_window_still_opens_an_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[&agent_ack("agentA")]);
+        let ledger = PromptLedger::shared();
+        ledger.record_text("/goal build a test page");
+
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+        // The launch is observed while NOT prompting, so agentA is not eligible
+        // for the held-turn suppression that would hide it for other reasons.
+        let _ = tick_now(&mut ws, &ledger);
+
+        let command = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.000Z","uuid":"u-cmd","promptId":"p1","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>build a test page</command-args>"}}"#;
+        let stdout = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.100Z","uuid":"u-out","promptId":"p1","message":{"role":"user","content":"<local-command-stdout>Goal set: build a test page</local-command-stdout>"}}"#;
+        let note = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.300Z","uuid":"u-note-agentA","promptId":"p1","isSidechain":false,"message":{"role":"user","content":"<task-notification>\n<task-id>agentA</task-id>\n<tool-use-id>toolu_01</tool-use-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>Build OK</result>\n</task-notification>"}}"#;
+        write_lines(
+            &path,
+            &[
+                command,
+                stdout,
+                // Settles BEFORE the foreground turn has written anything.
+                note,
+                &assistant_text("a1", "Build finished cleanly."),
+            ],
+        );
+        let (turns, ..) =
+            unpack(tick_prompting(&mut ws, &ledger).expect("settle event"));
+        // Not just "an episode opened": the settlement's own follow-up is what
+        // has nowhere else to render, so it must be IN the emitted turn.
+        assert!(
+            turns.iter().any(|t| t.blocks.iter().any(|b| matches!(
+                b,
+                crate::models::message::ContentBlock::Text { text } if text.contains("Build finished cleanly")
+            ))),
+            "the notification's follow-up must render in the overlay"
+        );
+    }
+
+    /// The window must never outlive the turn that opened it. Both resets are
+    /// asserted directly, because the `promptId` scoping makes their effect
+    /// invisible from the outside in all but contrived transcripts: the model's
+    /// first record closes it, and — for a turn that ends without ever writing
+    /// one — any non-prompting tick does. The reset is level-triggered on
+    /// purpose: an EDGE can be missed entirely (a whole turn can start and
+    /// finish between two polls, and a tick's own lines re-arm the window AFTER
+    /// the edge was handled), which would strand it set forever.
+    #[test]
+    fn submission_window_is_closed_by_the_reply_and_by_any_idle_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        let ledger = PromptLedger::shared();
+        ledger.record_text("/goal build a test page");
+        ledger.record_text("/goal try again");
+
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+        ws.epoch = Some(epoch("2020-01-01T00:00:00Z"));
+
+        let command = r#"{"type":"user","timestamp":"2026-07-07T03:50:00.000Z","uuid":"u-cmd","promptId":"p1","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>build a test page</command-args>"}}"#;
+        write_lines(&path, &[command, &assistant_text("a1", "On it.")]);
+        let _ = tick_prompting(&mut ws, &ledger);
+        assert!(
+            !ws.foreground_awaiting_reply,
+            "the model's first record closes the window"
+        );
+
+        // A second submission that never answers: armed while prompting…
+        let retry = r#"{"type":"user","timestamp":"2026-07-07T03:51:00.000Z","uuid":"u-cmd2","promptId":"p2","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>try again</command-args>"}}"#;
+        write_lines(&path, &[retry]);
+        let _ = tick_prompting(&mut ws, &ledger);
+        assert!(ws.foreground_awaiting_reply, "armed by the ledger match");
+        // …and closed by the first tick that observes the connection idle,
+        // whether or not that tick is the falling edge.
+        let _ = tick_now(&mut ws, &ledger);
+        assert!(
+            !ws.foreground_awaiting_reply,
+            "an idle tick closes a window no reply will ever close"
+        );
+    }
+
     /// The Critical arm-gap regression: a brand-new session's file (and its
     /// first prompt + launch ack) can exist BEFORE the watcher's first
     /// successful discovery — SessionStarted lags file creation by seconds.
@@ -1870,10 +2272,6 @@ mod tests {
             "settle must carry the launching tool_use_id for the in-memory flip"
         );
         assert_eq!(settled[0].result.as_deref(), Some("Build OK"));
-        assert!(
-            settled[0].wire_visible,
-            "a held-turn task's settle is wire-visible → frontend must not arm the syncing hint"
-        );
     }
 
     /// The exact real-world race that broke a naive "is_prompting right now"
@@ -1919,12 +2317,11 @@ mod tests {
             "must still suppress the overlay for an arbitrarily-delayed read, got {turns:?}"
         );
         assert_eq!(outstanding, 0);
-        // Settle still flows (un-suppressed) so the card can flip; wire_visible
-        // holds even though this tick read it after the falling edge (the set
-        // isn't cleared until the next rising edge).
+        // Settle still flows (un-suppressed) so the card can flip, even though
+        // this tick read it after the falling edge (the set isn't cleared until
+        // the next rising edge).
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].tool_use_id.as_deref(), Some("toolu_01"));
-        assert!(settled[0].wire_visible);
     }
 
     /// A turn that ends ABNORMALLY (cancelled, refused, etc — the same
@@ -1971,10 +2368,6 @@ mod tests {
             1,
             "the notification must fire — nothing else will tell the user"
         );
-        assert!(
-            !settled[0].wire_visible,
-            "an abnormally-ended turn released the id → reply not wire-visible, overlay shows it"
-        );
     }
 
     /// A background shell launched while `Prompting` must NOT enter
@@ -2015,10 +2408,6 @@ mod tests {
             settled.len(),
             1,
             "a shell's notification must never be suppressed"
-        );
-        assert!(
-            !settled[0].wire_visible,
-            "a shell is never in the launched set → not wire-visible"
         );
     }
 
@@ -2072,10 +2461,6 @@ mod tests {
         // The settle still flows to re-flip the card for the resumed run.
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].tool_use_id.as_deref(), Some("toolu_01"));
-        assert!(
-            settled[0].wire_visible,
-            "the resuming turn holds it open → wire-visible"
-        );
     }
 
     /// A cron//loop autonomous turn has no originating task id at all (its
@@ -2399,5 +2784,246 @@ mod tests {
         let cmd = r#"{"type":"user","uuid":"u-cmd","message":{"role":"user","content":"<command-name>/init</command-name><command-args>now</command-args>"}}"#;
         let cmd: serde_json::Value = serde_json::from_str(cmd).unwrap();
         assert_eq!(turn_initiator_text(&cmd).as_deref(), Some("/init now"));
+    }
+
+    /// The whole point of reading titles here: Claude Code's background
+    /// summarizer writes `ai-title` AFTER the turn that triggered it has
+    /// ended, and the ACP adapter only reads the name back at turn-end — so on
+    /// a short session nothing ever publishes it. That tail is pure metadata:
+    /// no turns, no settlements, no accounting change, so `tick` returns
+    /// `None`. The title must still come out, which is why `run_watch` takes
+    /// it independently of the activity event.
+    #[test]
+    fn a_title_only_tail_yields_no_activity_event_but_still_surfaces_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&ai_title("Find current vLLM stable release tag")]);
+
+        assert!(
+            tick_now(&mut ws, &ledger).is_none(),
+            "a title record is not background ACTIVITY"
+        );
+        assert_eq!(
+            ws.pending_title.take().as_deref(),
+            Some("Find current vLLM stable release tag")
+        );
+    }
+
+    /// Once taken, the same name must not be re-queued on every later tick —
+    /// each publish walks the state write lock and a DB write.
+    #[test]
+    fn an_unchanged_title_is_queued_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&ai_title("Fix the login flow")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("Fix the login flow"));
+
+        // Claude Code re-emits the record; the resolved name did not change.
+        write_lines(&path, &[&ai_title("Fix the login flow")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+
+        // A genuinely new name is queued again.
+        write_lines(&path, &[&ai_title("Fix the signup flow")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("Fix the signup flow"));
+    }
+
+    /// `customTitle ?? aiTitle` — Claude Code's own precedence, and the one
+    /// `parsers::claude` applies over the whole file. A generated title
+    /// arriving after the user named the session must not take the name back.
+    #[test]
+    fn a_user_set_title_outranks_a_later_generated_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&custom_title("auth-refactor")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("auth-refactor"));
+
+        write_lines(&path, &[&ai_title("Concise AI Summary")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title,
+            None,
+            "the generated title must not displace the user's own name"
+        );
+        assert_eq!(ws.resolved_title().as_deref(), Some("auth-refactor"));
+
+        // A NEW user-set name still wins.
+        write_lines(&path, &[&custom_title("auth-refactor-v2")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("auth-refactor-v2"));
+    }
+
+    /// Claude Code writes an empty `aiTitle` for trivial sessions. Publishing
+    /// it would rename the conversation to nothing.
+    #[test]
+    fn a_blank_title_record_is_never_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&ai_title("   ")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+        assert_eq!(ws.resolved_title(), None);
+    }
+
+    /// History before the arm baseline renders through the ordinary detail
+    /// fetch, which resolves the title from the whole file. Re-publishing it
+    /// from here would rename the conversation on every reconnect.
+    #[test]
+    fn a_title_in_pre_baseline_history_is_not_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-old", "old prompt"),
+                &ai_title("Old Session Name"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        // Arm with an epoch after the existing records, exactly as `run_watch`
+        // does for a resumed session, and take the real baseline.
+        ws.rearm("s1".to_string(), epoch("2030-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+
+        // A title written from here on IS this watch's to surface.
+        write_lines(&path, &[&ai_title("New Session Name")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("New Session Name"));
+    }
+
+    /// `customTitle ?? aiTitle` is a WHOLE-FILE rule, but the two records are
+    /// appended independently — `/rename` writes a lone `custom-title`, the
+    /// summarizer a lone `ai-title`. A session renamed BEFORE this watch armed
+    /// keeps its `custom-title` in the skipped history, so resolving over the
+    /// tail alone would let the very next `ai-title` (the CLI re-emits it
+    /// constantly) publish over the user's own name. The arm seeds the slots
+    /// from history to close that.
+    #[test]
+    fn a_pre_baseline_user_title_outranks_a_generated_one_read_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-old", "old prompt"),
+                &custom_title("auth-refactor"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        ws.rearm("s1".to_string(), epoch("2030-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+        assert_eq!(
+            ws.resolved_title().as_deref(),
+            Some("auth-refactor"),
+            "the arm must read the name the user already set"
+        );
+        assert_eq!(
+            ws.pending_title, None,
+            "seeding is not a publication — history rides the detail fetch"
+        );
+
+        // Only the GENERATED title lands in this watch's tail.
+        write_lines(&path, &[&ai_title("Concise AI Summary")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title, None,
+            "a generated title must not take the name back from the user"
+        );
+        assert_eq!(ws.resolved_title().as_deref(), Some("auth-refactor"));
+
+        // A new user-set name still publishes normally.
+        write_lines(&path, &[&custom_title("auth-refactor-v2")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title.take().as_deref(), Some("auth-refactor-v2"));
+    }
+
+    /// The CLI re-emits the SAME `ai-title` record throughout a session (228
+    /// identical copies in one observed transcript). On a resumed session the
+    /// first one past the baseline is a repeat of what history — and therefore
+    /// the detail fetch, and therefore the row — already holds, so seeding must
+    /// swallow it rather than spend a lifecycle write on a no-op.
+    #[test]
+    fn a_generated_title_already_in_history_is_not_republished() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-old", "old prompt"),
+                &ai_title("Old Session Name"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        ws.rearm("s1".to_string(), epoch("2030-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+
+        write_lines(&path, &[&ai_title("Old Session Name")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(ws.pending_title, None);
+
+        // A genuinely NEW generated name is still this watch's to surface.
+        write_lines(&path, &[&ai_title("Renamed By The Summarizer")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title.take().as_deref(),
+            Some("Renamed By The Summarizer")
+        );
+    }
+
+    /// A brand-new session baselines at offset 0 (its file is created after the
+    /// spawn epoch), so there is no history to seed and the seed must be a
+    /// no-op — the path this PR actually targets stays untouched.
+    #[test]
+    fn seeding_is_a_noop_for_a_fresh_session_whose_whole_file_is_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u-new", "first prompt"),
+                &ai_title("Find current vLLM stable release tag"),
+            ],
+        );
+
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::new();
+        ws.rearm("s1".to_string(), epoch("2020-01-01T00:00:00Z"));
+        ws.adopt_file(path.clone());
+        assert_eq!(ws.committed, 0, "the whole file belongs to this watch");
+        assert_eq!(ws.resolved_title(), None, "nothing to seed from");
+
+        let _ = tick_now(&mut ws, &ledger);
+        assert_eq!(
+            ws.pending_title.take().as_deref(),
+            Some("Find current vLLM stable release tag")
+        );
     }
 }

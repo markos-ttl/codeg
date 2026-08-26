@@ -11,12 +11,17 @@ import {
   buildAcpAdapterCheck,
   buildVersionCheck,
   configTextForClaudeSave,
+  extractCodexImportantValues,
   getAgentChecks,
   hostToolsAgentModeEnabled,
+  importantEnvKeysByAgent,
+  importantFieldsFor,
   inferGrokMode,
   materializeClaudeHardeningFlags,
   patchCodexConfigTomlText,
+  patchEnvByImportantKey,
   patchImportantConfigText,
+  rebaseDeepSeekDraft,
   setClaudeEnvFlagInConfigText,
   setHostToolsAgentMode,
 } from "./acp-agent-settings"
@@ -34,6 +39,7 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     skills_capable: true,
     registry_id: "hermes",
     registry_version: "0.16.0",
+    supports_custom_version: false,
     name: "Hermes Agent",
     description: "",
     available: true,
@@ -43,6 +49,7 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     enabled: true,
     sort_order: 0,
     installed_version: null,
+    host_tools_agent_mode: false,
     env: {},
     config_json: null,
     config_file_path: null,
@@ -1399,6 +1406,269 @@ describe("patchCodexConfigTomlText — codeg's requires_openai_auth default", ()
   })
 })
 
+describe("codex [features].default_mode_request_user_input toggle", () => {
+  const KEY = "default_mode_request_user_input"
+
+  /** What the panel's Switch will show after writing `configTomlText`. */
+  function readsBackAs(configTomlText: string): boolean {
+    return extractCodexImportantValues("", configTomlText)
+      .defaultModeRequestUserInput
+  }
+
+  it("is off for a config that never mentions the flag", () => {
+    expect(readsBackAs('model = "gpt-5"')).toBe(false)
+    expect(readsBackAs("")).toBe(false)
+  })
+
+  it("writes the key and reads it straight back", () => {
+    const result = patchCodexConfigTomlText("", {
+      defaultModeRequestUserInput: true,
+    })
+    expect(result).toContain(`${KEY} = true`)
+    expect(readsBackAs(result)).toBe(true)
+  })
+
+  it("reads a hand-written flag in either TOML spelling", () => {
+    expect(readsBackAs(`[features]\n${KEY} = true\n`)).toBe(true)
+    expect(readsBackAs(`features.${KEY} = true\n`)).toBe(true)
+  })
+
+  // The panel ships a raw config.toml editor, so the dotted spelling is
+  // reachable by hand even though `codex features enable` writes the section
+  // form. It has to WRITE as well as read, or the switch is a lie: TOML cannot
+  // hold `features.x = true` and `[features]` at once — the header is a hard
+  // "trying to redefine an already defined table" error — so a half-supported
+  // dotted key either snaps back on OFF or produces a file the backend refuses.
+  describe("the dotted spelling round-trips, not just reads", () => {
+    it("clears a dotted flag when switched off", () => {
+      const off = patchCodexConfigTomlText(
+        `model = "gpt-5"\nfeatures.${KEY} = true\n`,
+        { defaultModeRequestUserInput: false }
+      )
+      expect(off).not.toContain(KEY)
+      expect(readsBackAs(off)).toBe(false)
+    })
+
+    it("replaces a dotted flag instead of colliding with it", () => {
+      const on = patchCodexConfigTomlText(
+        `model = "gpt-5"\nfeatures.${KEY} = false\n`,
+        { defaultModeRequestUserInput: true }
+      )
+      expect(() => parseTomlDocument(on)).not.toThrow()
+      expect(
+        (parseTomlDocument(on) as { features?: Record<string, unknown> })
+          .features
+      ).toEqual({ [KEY]: true })
+      expect(readsBackAs(on)).toBe(true)
+    })
+
+    // `features.x` under `[model_providers.codeg]` is
+    // `model_providers.codeg.features.x` — a key codex ignores. Reading it
+    // would show a value no save could ever clear.
+    it("ignores the same text nested inside another section", () => {
+      expect(
+        readsBackAs(
+          `model_provider = "codeg"\n\n[model_providers.codeg]\nfeatures.${KEY} = true\n`
+        )
+      ).toBe(false)
+    })
+
+    // A dotted SIBLING also defines the `features` table implicitly, so
+    // opening a `[features]` header next to it is the same redefinition error.
+    // Join the sibling's spelling instead — and leave the sibling itself, which
+    // is somebody else's setting, exactly where it is.
+    it("joins a dotted sibling instead of opening a colliding section", () => {
+      const src = `model = "gpt-5"\nfeatures.skills = true\nfeatures.${KEY} = false\n`
+      const on = patchCodexConfigTomlText(src, {
+        defaultModeRequestUserInput: true,
+      })
+      expect(() => parseTomlDocument(on)).not.toThrow()
+      expect(
+        (parseTomlDocument(on) as { features?: Record<string, unknown> })
+          .features
+      ).toEqual({ skills: true, [KEY]: true })
+
+      const off = patchCodexConfigTomlText(on, {
+        defaultModeRequestUserInput: false,
+      })
+      expect(() => parseTomlDocument(off)).not.toThrow()
+      expect(
+        (parseTomlDocument(off) as { features?: Record<string, unknown> })
+          .features
+      ).toEqual({ skills: true })
+    })
+  })
+
+  // TOML allows a comment after a table header. Treating `[features] # flags`
+  // as an ordinary line makes the scanner miss the table entirely, so an upsert
+  // opens a second one and the file stops parsing — and a root-scoped scan runs
+  // on past the header into a table it must not touch.
+  describe("headers carrying a trailing comment are still headers", () => {
+    it("reuses a commented [features] instead of duplicating it", () => {
+      const src = `model = "gpt-5"\n\n[features] # flags\nskills = true\n`
+      for (const patch of [
+        { defaultModeRequestUserInput: true },
+        { skills: true },
+      ]) {
+        const out = patchCodexConfigTomlText(src, patch)
+        expect(() => parseTomlDocument(out)).not.toThrow()
+        // Exactly one header line, and it is still the user's commented one.
+        const headers = out
+          .split("\n")
+          .filter((line) => /^\s*\[features\]/.test(line))
+        expect(headers).toEqual(["[features] # flags"])
+      }
+    })
+
+    it("does not reach past one into another table's keys", () => {
+      const src = `model = "gpt-5"\n\n[model_providers.codeg] # my gateway\nfeatures.${KEY} = true\n`
+      // Nested, so the switch reads off — and switching it off must not go
+      // delete the provider-local key it never owned.
+      expect(readsBackAs(src)).toBe(false)
+      const off = patchCodexConfigTomlText(src, {
+        defaultModeRequestUserInput: false,
+      })
+      expect(off).toContain(`features.${KEY} = true`)
+      expect(() => parseTomlDocument(off)).not.toThrow()
+    })
+  })
+
+  // Upstream's default is false, so "off" removes the key rather than writing
+  // `= false`. Writing false would be equivalent to codex but would leave an
+  // under-development flag pinned in a config the user opted out of.
+  it("removes the key instead of writing false", () => {
+    const on = patchCodexConfigTomlText("", {
+      defaultModeRequestUserInput: true,
+    })
+    const off = patchCodexConfigTomlText(on, {
+      defaultModeRequestUserInput: false,
+    })
+    expect(off).not.toContain(KEY)
+    expect(readsBackAs(off)).toBe(false)
+  })
+
+  it("shares [features] with skills without disturbing it", () => {
+    const withSkills = patchCodexConfigTomlText("", { skills: true })
+    const both = patchCodexConfigTomlText(withSkills, {
+      defaultModeRequestUserInput: true,
+    })
+    const features = (
+      parseTomlDocument(both) as { features?: Record<string, unknown> }
+    ).features
+    expect(features).toMatchObject({ skills: true, [KEY]: true })
+
+    // Turning this one off must not take `skills` — or the section — with it.
+    const onlySkills = patchCodexConfigTomlText(both, {
+      defaultModeRequestUserInput: false,
+    })
+    expect(
+      (parseTomlDocument(onlySkills) as { features?: Record<string, unknown> })
+        .features
+    ).toEqual({ skills: true })
+  })
+
+  // The flag lives in the same `[features]` table the WebSocket toggle writes
+  // `responses_websockets_v2` into, and that key is rewritten on EVERY patch
+  // from the active provider's `supports_websockets`. A user who turns on
+  // questions must not lose their WebSocket setting as a side effect.
+  it("survives — and preserves — the websocket feature key", () => {
+    const toml = [
+      'model_provider = "codeg"',
+      "",
+      "[model_providers.codeg]",
+      'base_url = "https://example.test/v1"',
+      "supports_websockets = true",
+    ].join("\n")
+    const result = patchCodexConfigTomlText(toml, {
+      defaultModeRequestUserInput: true,
+    })
+    const features = (
+      parseTomlDocument(result) as { features?: Record<string, unknown> }
+    ).features
+    expect(features).toMatchObject({
+      responses_websockets_v2: true,
+      [KEY]: true,
+    })
+    expect(readsBackAs(result)).toBe(true)
+  })
+})
+
+// `responses_websockets_v2` is rewritten on EVERY patch from the resolved
+// WebSocket state, so any control — this one, skills, service tier, the model
+// field — can destroy it if the writer resolves it differently from the reader.
+describe("codex WebSocket feature key survives unrelated toggles", () => {
+  const KEY = "default_mode_request_user_input"
+
+  function websocketsOf(configTomlText: string): boolean {
+    return extractCodexImportantValues("", configTomlText).supportsWebsockets
+  }
+
+  // A config that declares WebSockets ONLY through the feature key: the reader
+  // falls back to it for the codeg provider, so the panel shows the switch on.
+  const FEATURE_ONLY = [
+    'model = "gpt-5"',
+    "",
+    "[features]",
+    "responses_websockets_v2 = true",
+  ].join("\n")
+
+  it("is shown as enabled when only the feature key declares it", () => {
+    expect(websocketsOf(FEATURE_ONLY)).toBe(true)
+  })
+
+  for (const [label, patch] of [
+    ["the questions toggle", { defaultModeRequestUserInput: true }],
+    ["the skills toggle", { skills: true }],
+    ["the fast service tier", { serviceTierFast: true }],
+  ] as const) {
+    it(`is not silently cleared by ${label}`, () => {
+      const after = patchCodexConfigTomlText(FEATURE_ONLY, patch)
+      expect(websocketsOf(after)).toBe(true)
+      expect(after).toContain("responses_websockets_v2 = true")
+    })
+  }
+
+  // The fallback reads the feature key, so a nested `features.…` line — which
+  // is really `model_providers.codeg.features.…` and means nothing to codex —
+  // must not reach it. Otherwise any unrelated toggle would quietly promote a
+  // provider-local key into a global WebSocket flag.
+  it("is not conjured out of a nested dotted key", () => {
+    const nested = [
+      'model_provider = "codeg"',
+      "",
+      "[model_providers.codeg]",
+      'base_url = "https://example.test/v1"',
+      "features.responses_websockets_v2 = true",
+    ].join("\n")
+    expect(websocketsOf(nested)).toBe(false)
+    const after = patchCodexConfigTomlText(nested, {
+      defaultModeRequestUserInput: true,
+    })
+    const features = (
+      parseTomlDocument(after) as { features?: Record<string, unknown> }
+    ).features
+    expect(features).toEqual({ [KEY]: true })
+  })
+
+  // The fallback must not outrank an explicit provider `false`, or the
+  // WebSocket switch itself could never be turned off.
+  it("still lets the WebSocket switch turn itself off", () => {
+    const bound = [
+      'model_provider = "codeg"',
+      "",
+      "[model_providers.codeg]",
+      'base_url = "https://example.test/v1"',
+      "supports_websockets = true",
+      "",
+      "[features]",
+      "responses_websockets_v2 = true",
+    ].join("\n")
+    const off = patchCodexConfigTomlText(bound, { supportsWebsockets: false })
+    expect(websocketsOf(off)).toBe(false)
+    expect(off).not.toContain("responses_websockets_v2")
+  })
+})
+
 describe("host-tools toggle — hand the fs/terminal channels back to the agent", () => {
   const KEY = "CODEG_ACP_HOST_TOOLS"
 
@@ -1458,5 +1728,213 @@ describe("host-tools toggle — hand the fs/terminal channels back to the agent"
     expect(hostToolsAgentModeEnabled(setHostToolsAgentMode(off, true))).toBe(
       true
     )
+  })
+})
+
+describe("rebaseDeepSeekDraft", () => {
+  // Only the fields this helper reads or writes; the rest of AgentDraft is
+  // spread through untouched, which the identity assertion below pins.
+  const draftOf = (envText: string) =>
+    ({
+      envText,
+      apiBaseUrl: "",
+      apiKey: "",
+      model: "",
+      enabled: true,
+      configText: "",
+    }) as unknown as Parameters<typeof rebaseDeepSeekDraft>[0]
+
+  it("folds the panel's keys in while leaving every other key alone", () => {
+    // The window's draft still holds the key it saw before another window
+    // saved a new one; the enable switch would persist this text wholesale.
+    //
+    // `DEEPSEEK_ACP_MODEL` is NOT a panel key — the panel shows no model field
+    // and never writes one, so the raw editor's line stays exactly as typed
+    // even when the persisted env disagrees with it.
+    const draft = draftOf(
+      "DEEPSEEK_API_KEY=sk-old\nDEEPSEEK_ACP_MODEL=deepseek-v4-flash\nSOMETHING_ELSE=keep-me"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: {
+        DEEPSEEK_API_KEY: "sk-new",
+        DEEPSEEK_ACP_MODEL: "deepseek-v4-pro",
+      },
+    })
+
+    const next = rebaseDeepSeekDraft(draft, agent)
+    const lines = next.envText.split("\n").sort()
+    expect(lines).toEqual([
+      "DEEPSEEK_ACP_MODEL=deepseek-v4-flash",
+      "DEEPSEEK_API_KEY=sk-new",
+      "SOMETHING_ELSE=keep-me",
+    ])
+    // The structured mirrors are recomputed from the patched text.
+    expect(next.apiKey).toBe("sk-new")
+    expect(next.model).toBe("deepseek-v4-flash")
+  })
+
+  it("does not rebase for a model-only change", () => {
+    // The model is not a panel key, so a model that moved elsewhere is not a
+    // reason to rewrite the draft (and risk a half-typed line in it).
+    const draft = draftOf("DEEPSEEK_ACP_MODEL=deepseek-v4-flash\nKEEP=1")
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_ACP_MODEL: "deepseek-v4-pro" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent)).toBe(draft)
+  })
+
+  it("deletes a panel key the persisted env no longer has", () => {
+    const draft = draftOf("DEEPSEEK_BASE_URL=https://old.example.com\nKEEP=1")
+    const agent = makeAgent({ agent_type: "deepseek" as AgentType, env: {} })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe("KEEP=1")
+  })
+
+  it("returns the SAME object when nothing moved", () => {
+    // A no-op refresh must not invalidate the draft identity.
+    const draft = draftOf("DEEPSEEK_API_KEY=sk-1\nOTHER=2")
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-1", OTHER: "ignored" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent)).toBe(draft)
+  })
+
+  it("keeps comments and half-typed lines when a key DID move", () => {
+    // The patch is textual: only the lines it owns are rewritten. A parse-and-
+    // reserialize would drop all three of these, and this rebase runs on the
+    // refresh that follows the panel's own save — i.e. while the user may well
+    // be typing in the raw editor next to it.
+    const draft = draftOf(
+      "# proxy for the office network\nDEEPSEEK_API_KEY=sk-old\n\nNEW_PROXY\nKEEP=1"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-new" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe(
+      "# proxy for the office network\nDEEPSEEK_API_KEY=sk-new\n\nNEW_PROXY\nKEEP=1"
+    )
+  })
+
+  it("survives an env var named after an Object.prototype member", () => {
+    // `constructor`, `toString` and friends are legal env var names, and a
+    // plain object answers `in` for all of them — reading one back yields a
+    // function where a string was expected and throws mid-patch, after the
+    // backend has already committed the save this rebase follows.
+    const draft = draftOf(
+      "constructor=keep\ntoString=keep\nDEEPSEEK_API_KEY=old"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-new" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe(
+      "constructor=keep\ntoString=keep\nDEEPSEEK_API_KEY=sk-new"
+    )
+  })
+
+  it("appends a new key above a trailing blank line", () => {
+    // That blank line is usually the one the user just pressed Enter on.
+    const draft = draftOf("KEEP=1\n")
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-1" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe(
+      "KEEP=1\nDEEPSEEK_API_KEY=sk-1\n"
+    )
+  })
+
+  it("treats a present-but-empty key as different from a missing one", () => {
+    // `patchEnvText` deletes a key whose persisted value is empty, so `KEY=`
+    // left in the draft IS a difference. The enable switch persists the draft
+    // wholesale, and an empty DEEPSEEK_BASE_URL is not "use the default" — it
+    // is an empty endpoint, which the adapter turns into an unusable URL.
+    const draft = draftOf("DEEPSEEK_BASE_URL=\nKEEP=1")
+    const agent = makeAgent({ agent_type: "deepseek" as AgentType, env: {} })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe("KEEP=1")
+  })
+
+  it("leaves a draft mid-edit alone when no panel key moved", () => {
+    // The rebase runs on every `refreshAgents`, including the one after an
+    // unrelated save. Folding the keys in reparses and reserializes the whole
+    // text, which drops comments, blank lines and a half-typed key — so the
+    // decision has to be made on the VALUES, before any rewrite.
+    const draft = draftOf(
+      "# proxy for the office network\nDEEPSEEK_API_KEY=sk-1\n\nNEW_PROXY"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-1" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent)).toBe(draft)
+  })
+})
+
+describe("important env keys", () => {
+  // Qoder is the only agent with an EMPTY slot (it talks solely to its own
+  // service, so there is no endpoint variable). `keys.apiBaseUrl[0]` is then
+  // `undefined`, and the writer used to hand that straight to `patchEnvText` —
+  // producing an env line literally named `undefined` and silently swallowing
+  // the value the user typed.
+  it("never writes an `undefined` key for a slot the agent has no var for", () => {
+    expect(importantEnvKeysByAgent("qoder" as AgentType).apiBaseUrl).toEqual([])
+    const before = "QODER_MODEL=qmodel_38max"
+    const after = patchEnvByImportantKey(
+      "qoder" as AgentType,
+      before,
+      "apiBaseUrl",
+      "https://example.com"
+    )
+    expect(after).toBe(before)
+    expect(after).not.toContain("undefined")
+  })
+
+  // …and the field is hidden, so the no-op above is unreachable in practice
+  // rather than a silently-ignored input the user can type into.
+  it("hides only the fields whose slot is empty", () => {
+    expect(importantFieldsFor("qoder" as AgentType)).toEqual({
+      apiBaseUrl: false,
+      apiKey: true,
+      model: true,
+    })
+    expect(importantFieldsFor("deepseek" as AgentType)).toEqual({
+      apiBaseUrl: true,
+      apiKey: true,
+      model: true,
+    })
+    // The generic fallback keeps all three for agents with no special-casing.
+    expect(importantFieldsFor("open_code" as AgentType)).toEqual({
+      apiBaseUrl: true,
+      apiKey: true,
+      model: true,
+    })
+  })
+
+  // The credential Qoder actually reads. Generic OPENAI_*/API_KEY aliases must
+  // stay out: Qoder reads neither, so listing them would let the auth panel
+  // report "configured" off a key that never reaches the agent.
+  it("writes Qoder's PAT and model to the vars the CLI documents", () => {
+    const keys = importantEnvKeysByAgent("qoder" as AgentType)
+    expect(keys.apiKey).toEqual(["QODER_PERSONAL_ACCESS_TOKEN"])
+    expect(keys.model).toEqual(["QODER_MODEL"])
+
+    const withPat = patchEnvByImportantKey(
+      "qoder" as AgentType,
+      "",
+      "apiKey",
+      "pat-123"
+    )
+    expect(withPat).toBe("QODER_PERSONAL_ACCESS_TOKEN=pat-123")
+    expect(
+      patchEnvByImportantKey(
+        "qoder" as AgentType,
+        withPat,
+        "model",
+        "qmodel_38max"
+      )
+    ).toContain("QODER_MODEL=qmodel_38max")
   })
 })

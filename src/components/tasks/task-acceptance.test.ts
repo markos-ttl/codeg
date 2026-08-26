@@ -1,13 +1,19 @@
 import { describe, expect, it } from "vitest"
 import type { WorkTask } from "@/lib/types"
 import {
+  canDeliverToPr,
+  canRemoveWorktree,
+  deliveredPrUrl,
   hasNothingToMerge,
   isFolderMerging,
   isMergeQueued,
   isWorktreeGone,
   mergeQueueRanks,
+  mustDeliverToPr,
+  usesMergeRequests,
   worktreeWasRemoved,
 } from "./task-acceptance"
+import { buildTaskActions } from "./task-actions"
 
 /** A parked merge, reduced to what the queue helpers actually read. */
 function queued(at: string): WorkTask["merge_queued"] {
@@ -176,5 +182,165 @@ describe("worktreeWasRemoved", () => {
         })
       )
     ).toBe(false)
+  })
+})
+
+describe("canRemoveWorktree", () => {
+  const done = { status: "done" } as const
+
+  it("offers the removal to a finished task still holding its worktree", () => {
+    // The merge / complete dialogs both let the user KEEP the worktree, so
+    // this is the state the drawer's own removal exists for.
+    expect(canRemoveWorktree(task({ ...done }))).toBe(true)
+  })
+
+  it("stays out of an unfinished task's way", () => {
+    // Mid-run the checkout is in use, and a reviewed task's worktree is what
+    // the acceptance is about to read — neither is housekeeping.
+    for (const status of ["todo", "running", "review", "merging"] as const) {
+      expect(canRemoveWorktree(task({ status }))).toBe(false)
+    }
+    // Canceled keeps its worktree on purpose: that task can be requeued, and
+    // requeuing wants the checkout it left behind.
+    expect(canRemoveWorktree(task({ status: "canceled" }))).toBe(false)
+  })
+
+  it("says nothing when there is no worktree left to remove", () => {
+    expect(canRemoveWorktree(task({ ...done, worktree_folder_id: null }))).toBe(
+      false
+    )
+    // Recorded, but its folder / directory went away behind the app — the card
+    // already reports that one as removed.
+    expect(canRemoveWorktree(task({ ...done, worktree_missing: true }))).toBe(
+      false
+    )
+  })
+
+  it("defers to the retry entry after a failed cleanup", () => {
+    // Same backend call, and that button names the failure — two of them in
+    // one bar would just be the same action twice.
+    expect(canRemoveWorktree(task({ ...done, cleanup_state: "failed" }))).toBe(
+      false
+    )
+  })
+})
+
+describe("canDeliverToPr", () => {
+  const issue = { source_kind: "forge_issue", files_changed: 3 } as const
+
+  it("offers delivery for a reviewed task that came from the forge", () => {
+    expect(canDeliverToPr(task({ ...issue }))).toBe(true)
+    // A pull-request task delivers too — back onto its own branch.
+    expect(canDeliverToPr(task({ ...issue, source_kind: "forge_pr" }))).toBe(
+      true
+    )
+    // A local task has no repository to push to.
+    expect(canDeliverToPr(task({ files_changed: 3 }))).toBe(false)
+    // Only from review: nothing to push before, nothing left after.
+    expect(canDeliverToPr(task({ ...issue, status: "running" }))).toBe(false)
+    expect(canDeliverToPr(task({ ...issue, status: "done" }))).toBe(false)
+  })
+
+  it("withholds it when there is nothing to put in a pull request", () => {
+    // GitHub answers an empty pull request with a 422 …
+    expect(canDeliverToPr(task({ ...issue, files_changed: 0 }))).toBe(false)
+    // … and a gone worktree has no branch left to push.
+    expect(canDeliverToPr(task({ ...issue, worktree_folder_id: null }))).toBe(
+      false
+    )
+    // Unknown stats are NOT "empty" — same fallback the merge button takes.
+    expect(canDeliverToPr(task({ ...issue, files_changed: null }))).toBe(true)
+  })
+})
+
+describe("mustDeliverToPr", () => {
+  it("marks the tasks whose local merge the backend refuses", () => {
+    // A pull request's work belongs on the pull request's branch: landing it
+    // locally would take those changes in behind the author's back.
+    expect(mustDeliverToPr(task({ source_kind: "forge_pr" }))).toBe(true)
+    // An issue's task may legitimately be landed here instead.
+    expect(mustDeliverToPr(task({ source_kind: "forge_issue" }))).toBe(false)
+    expect(mustDeliverToPr(task())).toBe(false)
+  })
+})
+
+describe("usesMergeRequests", () => {
+  it("follows the task's own provenance, not a guess", () => {
+    const gitlab = { provider: "gitlab" } as WorkTask["source_meta"]
+    const github = { provider: "github" } as WorkTask["source_meta"]
+    expect(
+      usesMergeRequests(task({ source_kind: "forge_pr", source_meta: gitlab }))
+    ).toBe(true)
+    expect(
+      usesMergeRequests(task({ source_kind: "forge_pr", source_meta: github }))
+    ).toBe(false)
+    // No provenance at all (a local task, or a row from before the column
+    // existed) keeps GitHub's wording, which is what it has always shown.
+    expect(usesMergeRequests(task())).toBe(false)
+    expect(usesMergeRequests(null)).toBe(false)
+  })
+})
+
+describe("deliveredPrUrl", () => {
+  it("links only a task that actually finished by delivering", () => {
+    const url = "https://github.com/acme/app/pull/42"
+    const meta = { result_pr: url } as WorkTask["source_meta"]
+    expect(
+      deliveredPrUrl(
+        task({
+          status: "done",
+          completion_kind: "delivered_pr",
+          source_meta: meta,
+        })
+      )
+    ).toBe(url)
+    // A merged task's source snapshot has no pull request to show.
+    expect(
+      deliveredPrUrl(task({ status: "done", completion_kind: "merged" }))
+    ).toBeNull()
+    // Rows that finished before the column existed stay silent rather than
+    // guessing from a stale snapshot.
+    expect(
+      deliveredPrUrl(task({ status: "done", source_meta: meta }))
+    ).toBeNull()
+  })
+})
+
+describe("the acceptance a review-only pull-request task offers", () => {
+  const handlers = {
+    onStart: () => {},
+    onCancel: () => {},
+    onRetry: () => {},
+    onRequeue: () => {},
+    onViewSession: () => {},
+    onMerge: () => {},
+    onDeliverPr: () => {},
+    onUnqueueMerge: () => {},
+    onComplete: () => {},
+    onArchive: () => {},
+    onEdit: () => {},
+    onSchedule: () => {},
+  }
+  const primary = (t: WorkTask): string | null =>
+    buildTaskActions(t, (key) => key, handlers).primary?.label ?? null
+
+  const fromPr = { source_kind: "forge_pr" as const, conversation_id: null }
+
+  // A task triggered from a pull request is checked out ON that pull request,
+  // so its worktree holds the whole contribution before the agent starts. The
+  // counters are measured from that checkout point, which is what keeps a
+  // review turn that committed nothing at zero here — anything else offers a
+  // push back with nothing in it (and the backend refuses that one).
+  it("is completing, not a push back that would carry nothing", () => {
+    const reviewOnly = task({ ...fromPr, files_changed: 0 })
+    expect(hasNothingToMerge(reviewOnly)).toBe(true)
+    expect(canDeliverToPr(reviewOnly)).toBe(false)
+    expect(primary(reviewOnly)).toBe("actionComplete")
+  })
+
+  it("is the push back once the agent has committed something of its own", () => {
+    const withWork = task({ ...fromPr, files_changed: 2 })
+    expect(canDeliverToPr(withWork)).toBe(true)
+    expect(primary(withWork)).toBe("actionDeliverPrBack")
   })
 })
