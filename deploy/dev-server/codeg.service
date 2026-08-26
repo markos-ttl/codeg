@@ -1,0 +1,25 @@
+[Unit]
+Description=Codeg headless server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codeg
+Group=codeg
+WorkingDirectory=/srv/codeg/projects
+Environment=HOME=/var/lib/codeg
+Environment=CODEG_HOST=0.0.0.0
+Environment=CODEG_PORT=3080
+Environment=CODEG_DATA_DIR=/var/lib/codeg
+Environment=CODEG_STATIC_DIR=/opt/codeg-dev/current/web
+EnvironmentFile=/etc/codeg/codeg.env
+ExecStart=/opt/codeg-dev/current/codeg-server
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

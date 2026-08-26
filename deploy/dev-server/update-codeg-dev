@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly release_url="https://github.com/markos-ttl/codeg/releases/download/dev-latest"
+readonly archive_name="codeg-server-linux-x64.tar.gz"
+readonly install_root="/opt/codeg-dev"
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf -- "$tmp_dir"' EXIT
+
+curl --fail --location --silent --show-error \
+  "$release_url/$archive_name" \
+  --output "$tmp_dir/$archive_name"
+curl --fail --location --silent --show-error \
+  "$release_url/$archive_name.sha256" \
+  --output "$tmp_dir/$archive_name.sha256"
+
+sed -i "s#  .*#  $archive_name#" "$tmp_dir/$archive_name.sha256"
+(
+  cd "$tmp_dir"
+  sha256sum --check "$archive_name.sha256"
+)
+
+bundle_sha="$(sha256sum "$tmp_dir/$archive_name" | cut -d' ' -f1)"
+release_dir="$install_root/releases/$bundle_sha"
+
+if [[ ! -d "$release_dir" ]]; then
+  tar -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"
+  install -d -m 0755 "$install_root/releases"
+  mv "$tmp_dir/codeg-server-linux-x64" "$release_dir"
+  chmod 0755 "$release_dir/codeg-server" "$release_dir/codeg-mcp"
+fi
+
+ln -sfn "$release_dir" "$install_root/current.next"
+mv -Tf "$install_root/current.next" "$install_root/current"
+systemctl restart codeg.service

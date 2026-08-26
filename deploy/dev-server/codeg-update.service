@@ -1,0 +1,8 @@
+[Unit]
+Description=Update Codeg from the rolling dev release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/update-codeg-dev
