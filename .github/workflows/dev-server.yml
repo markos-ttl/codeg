@@ -1,0 +1,93 @@
+name: Build dev server
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-server
+  cancel-in-progress: true
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test Kilo model management
+        run: pnpm exec vitest run src/lib/kilo-model-config.test.ts src/components/chat/model-option-list.test.tsx
+
+      - name: Build web client
+        run: pnpm build
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          shared-key: dev-server-linux-x64
+
+      - name: Build server binaries
+        working-directory: src-tauri
+        run: |
+          cargo build --release --bin codeg-server --no-default-features
+          cargo build --release --bin codeg-mcp --no-default-features
+
+      - name: Package server bundle
+        shell: bash
+        run: |
+          mkdir -p dist/codeg-server-linux-x64
+          cp src-tauri/target/release/codeg-server dist/codeg-server-linux-x64/
+          cp src-tauri/target/release/codeg-mcp dist/codeg-server-linux-x64/
+          cp -R out dist/codeg-server-linux-x64/web
+          tar -C dist -czf dist/codeg-server-linux-x64.tar.gz codeg-server-linux-x64
+          sha256sum dist/codeg-server-linux-x64.tar.gz > dist/codeg-server-linux-x64.tar.gz.sha256
+
+      - name: Publish rolling dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git tag --force dev-latest "$GITHUB_SHA"
+          git push --force origin refs/tags/dev-latest
+
+          if gh release view dev-latest >/dev/null 2>&1; then
+            gh release upload dev-latest \
+              dist/codeg-server-linux-x64.tar.gz \
+              dist/codeg-server-linux-x64.tar.gz.sha256 \
+              --clobber
+            gh release edit dev-latest \
+              --target "$GITHUB_SHA" \
+              --title "Codeg dev server" \
+              --notes "Rolling Linux x64 server build from the dev branch at $GITHUB_SHA." \
+              --prerelease
+          else
+            gh release create dev-latest \
+              dist/codeg-server-linux-x64.tar.gz \
+              dist/codeg-server-linux-x64.tar.gz.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "Codeg dev server" \
+              --notes "Rolling Linux x64 server build from the dev branch at $GITHUB_SHA." \
+              --prerelease
+          fi
