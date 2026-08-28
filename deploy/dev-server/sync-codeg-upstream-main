@@ -51,5 +51,6 @@ git --git-dir="$repo_dir" worktree add --detach "$merge_dir" \
 git -C "$merge_dir" \
   -c user.name="Codeg upstream sync" \
   -c user.email="codeg-upstream-sync@users.noreply.github.com" \
+  -c commit.gpgSign=false \
   merge --no-edit refs/heads/upstream-main
 git -C "$merge_dir" push "$fork_url" HEAD:refs/heads/dev
