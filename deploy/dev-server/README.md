@@ -26,8 +26,10 @@ Open `http://SERVER-IP:3080` and enter that token. In Codeg, open Settings,
 then Agents, and install the Claude Code adapter. Codeg launches
 `claude-agent-acp`; a separate desktop GUI is not required on the server.
 
-The timer checks the rolling release once per hour. Run an update immediately
-with:
+The timer checks the rolling release checksum once per hour. It downloads the
+server archive and restarts Codeg only when that checksum changes. After a
+successful update, it removes the temporary archive and older extracted
+releases. Run an update check immediately with:
 
 ```bash
 sudo systemctl start codeg-update.service

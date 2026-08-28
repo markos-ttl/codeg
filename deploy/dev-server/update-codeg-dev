@@ -1,31 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly release_url="https://github.com/markos-ttl/codeg/releases/download/dev-latest"
+readonly release_url="${CODEG_RELEASE_URL:-https://github.com/markos-ttl/codeg/releases/download/dev-latest}"
 readonly archive_name="codeg-server-linux-x64.tar.gz"
-readonly install_root="/opt/codeg-dev"
+readonly install_root="${CODEG_INSTALL_ROOT:-/opt/codeg-dev}"
+
+prune_releases() {
+  local keep_sha="$1"
+  [[ -d "$install_root/releases" ]] || return 0
+  find "$install_root/releases" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    ! -name "$keep_sha" \
+    -exec rm -rf -- {} +
+}
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 
 curl --fail --location --silent --show-error \
-  "$release_url/$archive_name" \
-  --output "$tmp_dir/$archive_name"
-curl --fail --location --silent --show-error \
   "$release_url/$archive_name.sha256" \
   --output "$tmp_dir/$archive_name.sha256"
 
-sed -i "s#  .*#  $archive_name#" "$tmp_dir/$archive_name.sha256"
-(
-  cd "$tmp_dir"
-  sha256sum --check "$archive_name.sha256"
-)
+expected_sha="$(awk 'NR == 1 { print $1 }' "$tmp_dir/$archive_name.sha256" | tr 'A-F' 'a-f')"
+if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Invalid checksum in $archive_name.sha256" >&2
+  exit 1
+fi
 
-bundle_sha="$(sha256sum "$tmp_dir/$archive_name" | cut -d' ' -f1)"
-release_dir="$install_root/releases/$bundle_sha"
+current_release="$(readlink -f "$install_root/current" 2>/dev/null || true)"
+expected_release="$install_root/releases/$expected_sha"
+if [[ "$current_release" == "$expected_release" ]] && \
+  [[ -x "$current_release/codeg-server" ]] && \
+  [[ -x "$current_release/codeg-mcp" ]]; then
+  prune_releases "$expected_sha"
+  echo "Codeg is already current at $expected_sha"
+  exit 0
+fi
 
-if [[ ! -d "$release_dir" ]]; then
+curl --fail --location --silent --show-error \
+  "$release_url/$archive_name" \
+  --output "$tmp_dir/$archive_name"
+
+actual_sha="$(sha256sum "$tmp_dir/$archive_name" | cut -d' ' -f1)"
+if [[ "$actual_sha" != "$expected_sha" ]]; then
+  echo "Checksum mismatch for $archive_name" >&2
+  exit 1
+fi
+
+release_dir="$expected_release"
+
+if [[ ! -x "$release_dir/codeg-server" ]] || [[ ! -x "$release_dir/codeg-mcp" ]]; then
+  rm -rf -- "$release_dir"
   tar -xzf "$tmp_dir/$archive_name" -C "$tmp_dir"
+  if [[ ! -f "$tmp_dir/codeg-server-linux-x64/codeg-server" ]] || \
+    [[ ! -f "$tmp_dir/codeg-server-linux-x64/codeg-mcp" ]]; then
+    echo "Downloaded bundle is missing a server binary" >&2
+    exit 1
+  fi
   install -d -m 0755 "$install_root/releases"
   mv "$tmp_dir/codeg-server-linux-x64" "$release_dir"
   chmod 0755 "$release_dir/codeg-server" "$release_dir/codeg-mcp"
@@ -34,3 +67,5 @@ fi
 ln -sfn "$release_dir" "$install_root/current.next"
 mv -Tf "$install_root/current.next" "$install_root/current"
 systemctl restart codeg.service
+prune_releases "$expected_sha"
+echo "Updated Codeg to $expected_sha"
