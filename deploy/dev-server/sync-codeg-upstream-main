@@ -6,6 +6,16 @@ readonly repo_dir="$state_dir/repo.git"
 readonly key_file="/etc/codeg-upstream-sync/id_ed25519"
 readonly upstream_url="https://github.com/xintaofei/codeg.git"
 readonly fork_url="git@github.com:markos-ttl/codeg.git"
+merge_dir=""
+
+cleanup() {
+  if [[ -n "$merge_dir" && -d "$merge_dir" ]]; then
+    git --git-dir="$repo_dir" worktree remove --force "$merge_dir" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
+trap cleanup EXIT
 
 if [[ ! -f "$key_file" ]]; then
   echo "Missing repository deploy key: $key_file" >&2
@@ -23,3 +33,23 @@ git --git-dir="$repo_dir" fetch --prune "$upstream_url" \
 export GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 git --git-dir="$repo_dir" push "$fork_url" \
   refs/heads/upstream-main:refs/heads/main
+
+git --git-dir="$repo_dir" fetch "$fork_url" \
+  +refs/heads/dev:refs/heads/fork-dev
+
+if git --git-dir="$repo_dir" merge-base --is-ancestor \
+  refs/heads/upstream-main refs/heads/fork-dev; then
+  echo "Fork dev already contains the latest fork main commit."
+  exit 0
+fi
+
+merge_dir="$(mktemp -d "$state_dir/dev-merge.XXXXXX")"
+rmdir "$merge_dir"
+
+git --git-dir="$repo_dir" worktree add --detach "$merge_dir" \
+  refs/heads/fork-dev
+git -C "$merge_dir" \
+  -c user.name="Codeg upstream sync" \
+  -c user.email="codeg-upstream-sync@users.noreply.github.com" \
+  merge --no-edit refs/heads/upstream-main
+git -C "$merge_dir" push "$fork_url" HEAD:refs/heads/dev

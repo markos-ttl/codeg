@@ -49,8 +49,16 @@ TLS reverse proxy before exposing it to the public internet.
 ## Upstream fork sync
 
 `install-upstream-sync.sh` configures one host to check upstream every six
-hours. The sync uses a repository-scoped write deploy key and a normal
-fast-forward push. It refuses to overwrite a diverged fork `main`.
+hours. Each successful run:
+
+1. Fast-forwards `markos-ttl/codeg:main` from `xintaofei/codeg:main`.
+2. Merges the updated fork `main` into `markos-ttl/codeg:dev`.
+
+Both pushes are normal fast-forward pushes. They refuse to overwrite a
+diverged fork `main` or new work pushed to `dev` during the sync. Personal
+commits remain on `dev`, and a successful merge triggers the rolling dev
+builds. A merge conflict fails the sync job without changing the remote `dev`
+branch.
 
 After registering the printed public key on `markos-ttl/codeg`, start the first
 sync and inspect it with:
@@ -60,3 +68,6 @@ sudo systemctl start codeg-upstream-sync.service
 systemctl status codeg-upstream-sync.service
 systemctl list-timers codeg-upstream-sync.timer
 ```
+
+Rerun `install-upstream-sync.sh` after changing the checked-in sync script so
+the copy in `/usr/local/sbin` is updated.
