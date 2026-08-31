@@ -407,6 +407,10 @@
         "title": "إغلاق التبويب الحالي",
         "description": "إغلاق المحادثة الحالية أو تبويب الملف الحالي"
       },
+      "reopen_last_closed_tab": {
+        "title": "إعادة فتح التبويب المغلق",
+        "description": "إعادة فتح آخر تبويب محادثة أو ملف تم إغلاقه"
+      },
       "close_all_file_tabs": {
         "title": "إغلاق جميع تبويبات الملفات",
         "description": "إغلاق جميع تبويبات الملفات المفتوحة عندما تكون لوحة الملفات نشطة"
@@ -418,6 +422,42 @@
       "prev_tab": {
         "title": "علامة التبويب السابقة",
         "description": "التبديل إلى علامة تبويب المحادثة أو الملف السابقة"
+      },
+      "switch_tab_1": {
+        "title": "التبديل إلى التبويب 1",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 1"
+      },
+      "switch_tab_2": {
+        "title": "التبديل إلى التبويب 2",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 2"
+      },
+      "switch_tab_3": {
+        "title": "التبديل إلى التبويب 3",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 3"
+      },
+      "switch_tab_4": {
+        "title": "التبديل إلى التبويب 4",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 4"
+      },
+      "switch_tab_5": {
+        "title": "التبديل إلى التبويب 5",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 5"
+      },
+      "switch_tab_6": {
+        "title": "التبديل إلى التبويب 6",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 6"
+      },
+      "switch_tab_7": {
+        "title": "التبديل إلى التبويب 7",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 7"
+      },
+      "switch_tab_8": {
+        "title": "التبديل إلى التبويب 8",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 8"
+      },
+      "switch_tab_9": {
+        "title": "التبديل إلى التبويب 9",
+        "description": "الانتقال إلى تبويب المحادثة أو الملف رقم 9"
       },
       "send_message": {
         "title": "إرسال الرسالة",
@@ -1840,6 +1880,9 @@
       "model": "النموذج",
       "status": "الحالة",
       "gitBranch": "فرع Git",
+      "folder": "المجلد",
+      "folderPath": "المسار",
+      "worktree": "شجرة العمل",
       "parentId": "الجلسة الأصلية",
       "tokensHeading": "استخدام الرموز",
       "totalTokens": "الإجمالي",
@@ -2019,6 +2062,15 @@
       "manageTitle": "المجلدات المرتبطة",
       "addTargetsTitle": "إضافة مجلدات للربط",
       "pickRootDescription": "اختر المجلد الرئيسي لمساحة العمل هذه.",
+      "pickWorkspaceDescription": "اختر مساحة العمل التي تريد فتح مجلد منها.",
+      "searchWorkspaces": "البحث في مساحات العمل",
+      "thisPc": "هذا الجهاز",
+      "thisPcHint": "المجلدات على هذا الجهاز",
+      "noWorkspaceMatch": "لا توجد مساحة عمل تطابق “{query}”",
+      "changeWorkspace": "تغيير",
+      "pickRootRemoteDescription": "اختر مجلدًا على {name}. سيُفتح في نافذة مساحة العمل هذه.",
+      "openInWorkspace": "فتح",
+      "remoteOpenFailed": "تعذّر فتح المجلد على {name}",
       "linksDescription": "اربط مجلدات أخرى كمجلدات فرعية ليتمكن الوكلاء من العمل عليها جميعًا من مساحة عمل واحدة.",
       "addTargetsDescription": "اختر مجلدًا واحدًا أو أكثر. سيصبح كل منها مجلدًا فرعيًا في مساحة العمل.",
       "useSystemPicker": "منتقي النظام",
@@ -2725,6 +2777,7 @@
           "downloadFailed": "فشل تنزيل {agent}: {message}",
           "sessionLoadResourceNotFound": "فشل تحميل جلسة {agent}. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
           "sessionLoadUnavailable": "تعذّر على {agent} استعادة هذه الجلسة، فقد تكون انتهت أو توقّف الوكيل. أعد التحميل لإعادة المحاولة، أو ابدأ محادثة جديدة.",
+          "sessionArchived": "تمت أرشفة الجلسة السابقة من جهة {agent}. شغّل {command} في الطرفية لاستعادتها وإعادة تحميلها، أو ابدأ محادثة جديدة.",
           "turnFailedRefusal": "رفض {agent} متابعة هذه الجولة. يدل ذلك غالبًا على خطأ في الخلفية أو البوابة. يرجى مراجعة سجلات الوكيل.",
           "turnFailedMaxTokens": "بلغ {agent} الحد الأقصى للرموز المسموح بها في هذه الجولة.",
           "turnFailedMaxTurnRequests": "بلغ {agent} الحد الأقصى لعدد الطلبات المسموح بها في هذه الجولة.",
@@ -3083,6 +3136,8 @@
         "errorTitle": "فشل تحميل الجلسة",
         "errorActionReload": "إعادة تحميل",
         "errorActionNewSession": "محادثة جديدة",
+        "errorActionCopyCommand": "نسخ الأمر",
+        "errorActionCommandCopied": "تم النسخ",
         "emptyConversation": "لا توجد رسائل في هذه المحادثة.",
         "systemMessage": "رسالة النظام",
         "copyMessage": "نسخ",
@@ -3111,6 +3166,9 @@
         "tokenCacheRead": "قراءة التخزين المؤقت",
         "tokenCacheWrite": "كتابة التخزين المؤقت",
         "duration": "المدة",
+        "worked": "انتهى العمل",
+        "workedFor": "عمل لمدة {duration}",
+        "working": "جارٍ العمل...",
         "completedAt": "وقت الإنجاز",
         "jumpToPreviousUserMessage": "الانتقال إلى رسالة المستخدم",
         "showMore": "عرض المزيد",
@@ -5283,6 +5341,7 @@
     "commentUnknownAuthor": "غير معروف",
     "commentEmptyBody": "(تعليق فارغ)",
     "commentPlaceholder": "اكتب تعليقًا…",
+    "commentAs": "التعليق باسم {name}",
     "commentSubmit": "تعليق",
     "commentSubmitting": "جارٍ النشر…",
     "closeItem": "إغلاق",

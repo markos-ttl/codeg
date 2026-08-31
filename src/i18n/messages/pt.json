@@ -407,6 +407,10 @@
         "title": "Fechar aba atual",
         "description": "Fecha a conversa atual ou aba de arquivo"
       },
+      "reopen_last_closed_tab": {
+        "title": "Reabrir aba fechada",
+        "description": "Reabrir a última aba de conversa ou arquivo fechada"
+      },
       "close_all_file_tabs": {
         "title": "Fechar todas as abas de arquivo",
         "description": "Fecha todas as abas de arquivo abertas quando o painel de arquivos está ativo"
@@ -418,6 +422,42 @@
       "prev_tab": {
         "title": "Aba anterior",
         "description": "Mudar para a aba anterior de conversa ou arquivo"
+      },
+      "switch_tab_1": {
+        "title": "Ir para a aba 1",
+        "description": "Saltar para a aba de conversa ou arquivo 1"
+      },
+      "switch_tab_2": {
+        "title": "Ir para a aba 2",
+        "description": "Saltar para a aba de conversa ou arquivo 2"
+      },
+      "switch_tab_3": {
+        "title": "Ir para a aba 3",
+        "description": "Saltar para a aba de conversa ou arquivo 3"
+      },
+      "switch_tab_4": {
+        "title": "Ir para a aba 4",
+        "description": "Saltar para a aba de conversa ou arquivo 4"
+      },
+      "switch_tab_5": {
+        "title": "Ir para a aba 5",
+        "description": "Saltar para a aba de conversa ou arquivo 5"
+      },
+      "switch_tab_6": {
+        "title": "Ir para a aba 6",
+        "description": "Saltar para a aba de conversa ou arquivo 6"
+      },
+      "switch_tab_7": {
+        "title": "Ir para a aba 7",
+        "description": "Saltar para a aba de conversa ou arquivo 7"
+      },
+      "switch_tab_8": {
+        "title": "Ir para a aba 8",
+        "description": "Saltar para a aba de conversa ou arquivo 8"
+      },
+      "switch_tab_9": {
+        "title": "Ir para a aba 9",
+        "description": "Saltar para a aba de conversa ou arquivo 9"
       },
       "send_message": {
         "title": "Enviar mensagem",
@@ -1840,6 +1880,9 @@
       "model": "Modelo",
       "status": "Estado",
       "gitBranch": "Branch do Git",
+      "folder": "Pasta",
+      "folderPath": "Caminho",
+      "worktree": "Worktree",
       "parentId": "Sessão principal",
       "tokensHeading": "Uso de tokens",
       "totalTokens": "Total",
@@ -2019,6 +2062,15 @@
       "manageTitle": "Pastas vinculadas",
       "addTargetsTitle": "Adicionar pastas para vincular",
       "pickRootDescription": "Escolha a pasta principal deste espaço de trabalho.",
+      "pickWorkspaceDescription": "Escolha de qual espaço de trabalho abrir uma pasta.",
+      "searchWorkspaces": "Pesquisar espaços de trabalho",
+      "thisPc": "Este computador",
+      "thisPcHint": "Pastas nesta máquina",
+      "noWorkspaceMatch": "Nenhum espaço de trabalho corresponde a “{query}”",
+      "changeWorkspace": "Alterar",
+      "pickRootRemoteDescription": "Escolha uma pasta em {name}. Ela será aberta na janela desse espaço de trabalho.",
+      "openInWorkspace": "Abrir",
+      "remoteOpenFailed": "Falha ao abrir a pasta em {name}",
       "linksDescription": "Vincule outras pastas como subdiretórios para que os agentes trabalhem em todas elas a partir de um único espaço de trabalho.",
       "addTargetsDescription": "Selecione uma ou mais pastas. Cada uma vira um subdiretório do espaço de trabalho.",
       "useSystemPicker": "Seletor do sistema",
@@ -2725,6 +2777,7 @@
           "downloadFailed": "Falha no download de {agent}: {message}",
           "sessionLoadResourceNotFound": "Falha ao carregar a sessão de {agent}. Recarregue para tentar novamente ou inicie uma nova conversa.",
           "sessionLoadUnavailable": "{agent} não conseguiu restaurar esta sessão; ela pode ter terminado ou o agente parou. Recarregue para tentar novamente ou inicie uma nova conversa.",
+          "sessionArchived": "A sessão anterior foi arquivada pelo {agent}. Execute {command} num terminal para restaurá-la e recarregá-la, ou inicie uma nova conversa.",
           "turnFailedRefusal": "{agent} recusou continuar este turno. Costuma indicar um erro de backend ou gateway. Confira os logs do agente.",
           "turnFailedMaxTokens": "{agent} atingiu o limite máximo de tokens para este turno.",
           "turnFailedMaxTurnRequests": "{agent} atingiu o número máximo de solicitações permitidas para este turno.",
@@ -3083,6 +3136,8 @@
         "errorTitle": "Falha ao carregar a sessão",
         "errorActionReload": "Recarregar",
         "errorActionNewSession": "Nova conversa",
+        "errorActionCopyCommand": "Copiar comando",
+        "errorActionCommandCopied": "Copiado",
         "emptyConversation": "Nenhuma mensagem nesta conversa.",
         "systemMessage": "Mensagem do sistema",
         "copyMessage": "Copiar",
@@ -3111,6 +3166,9 @@
         "tokenCacheRead": "Leitura de cache",
         "tokenCacheWrite": "Escrita de cache",
         "duration": "Duração",
+        "worked": "Trabalho concluído",
+        "workedFor": "Trabalhou por {duration}",
+        "working": "Trabalhando...",
         "completedAt": "Concluído às",
         "jumpToPreviousUserMessage": "Ir para a mensagem do usuário",
         "showMore": "Mostrar mais",
@@ -5283,6 +5341,7 @@
     "commentUnknownAuthor": "Desconhecido",
     "commentEmptyBody": "(comentário vazio)",
     "commentPlaceholder": "Escreva um comentário…",
+    "commentAs": "Comentando como {name}",
     "commentSubmit": "Comentar",
     "commentSubmitting": "A publicar…",
     "closeItem": "Fechar",

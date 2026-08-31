@@ -407,6 +407,10 @@
         "title": "현재 탭 닫기",
         "description": "현재 대화 또는 파일 탭을 닫습니다"
       },
+      "reopen_last_closed_tab": {
+        "title": "닫은 탭 다시 열기",
+        "description": "가장 최근에 닫은 대화 또는 파일 탭을 다시 엽니다"
+      },
       "close_all_file_tabs": {
         "title": "모든 파일 탭 닫기",
         "description": "파일 패널이 활성 상태일 때 열린 모든 파일 탭을 닫습니다"
@@ -418,6 +422,42 @@
       "prev_tab": {
         "title": "이전 탭",
         "description": "이전 대화 또는 파일 탭으로 전환"
+      },
+      "switch_tab_1": {
+        "title": "1번 탭으로 이동",
+        "description": "1번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_2": {
+        "title": "2번 탭으로 이동",
+        "description": "2번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_3": {
+        "title": "3번 탭으로 이동",
+        "description": "3번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_4": {
+        "title": "4번 탭으로 이동",
+        "description": "4번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_5": {
+        "title": "5번 탭으로 이동",
+        "description": "5번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_6": {
+        "title": "6번 탭으로 이동",
+        "description": "6번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_7": {
+        "title": "7번 탭으로 이동",
+        "description": "7번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_8": {
+        "title": "8번 탭으로 이동",
+        "description": "8번째 대화 또는 파일 탭으로 이동"
+      },
+      "switch_tab_9": {
+        "title": "9번 탭으로 이동",
+        "description": "9번째 대화 또는 파일 탭으로 이동"
       },
       "send_message": {
         "title": "메시지 보내기",
@@ -1840,6 +1880,9 @@
       "model": "모델",
       "status": "상태",
       "gitBranch": "Git 브랜치",
+      "folder": "폴더",
+      "folderPath": "경로",
+      "worktree": "워크트리",
       "parentId": "상위 세션",
       "tokensHeading": "토큰 사용량",
       "totalTokens": "합계",
@@ -2019,6 +2062,15 @@
       "manageTitle": "연결된 폴더",
       "addTargetsTitle": "연결할 폴더 추가",
       "pickRootDescription": "이 작업 공간의 기본 폴더를 선택하세요.",
+      "pickWorkspaceDescription": "폴더를 열 워크스페이스를 선택하세요.",
+      "searchWorkspaces": "워크스페이스 검색",
+      "thisPc": "이 PC",
+      "thisPcHint": "이 컴퓨터의 폴더",
+      "noWorkspaceMatch": "“{query}”과(와) 일치하는 워크스페이스가 없습니다",
+      "changeWorkspace": "변경",
+      "pickRootRemoteDescription": "{name}에서 폴더를 선택하세요. 해당 워크스페이스 창에서 열립니다.",
+      "openInWorkspace": "열기",
+      "remoteOpenFailed": "{name}에서 폴더를 열지 못했습니다",
       "linksDescription": "다른 폴더를 하위 디렉터리로 연결하면 에이전트가 하나의 작업 공간에서 여러 프로젝트를 함께 다룰 수 있습니다.",
       "addTargetsDescription": "폴더를 하나 이상 선택하세요. 각각 작업 공간의 하위 디렉터리가 됩니다.",
       "useSystemPicker": "시스템 선택기",
@@ -2725,6 +2777,7 @@
           "downloadFailed": "{agent} 다운로드 실패: {message}",
           "sessionLoadResourceNotFound": "{agent} 세션 불러오기에 실패했습니다. 다시 불러와 재시도하거나 새 대화를 시작하세요.",
           "sessionLoadUnavailable": "{agent}에서 이 세션을 복원할 수 없습니다. 세션이 종료되었거나 에이전트가 중지되었을 수 있습니다. 다시 불러와 재시도하거나 새 대화를 시작하세요.",
+          "sessionArchived": "이전 세션은 {agent} 측에서 보관되었습니다. 터미널에서 {command}을(를) 실행해 복원한 뒤 다시 불러오거나 새 대화를 시작하세요.",
           "turnFailedRefusal": "{agent}이(가) 이번 턴을 계속하지 않았습니다. 백엔드나 게이트웨이 오류일 수 있습니다. 에이전트 로그를 확인하세요.",
           "turnFailedMaxTokens": "{agent}이(가) 이번 턴의 최대 토큰 한도에 도달했습니다.",
           "turnFailedMaxTurnRequests": "{agent}이(가) 이번 턴에서 허용된 최대 요청 수에 도달했습니다.",
@@ -3083,6 +3136,8 @@
         "errorTitle": "세션 불러오기 실패",
         "errorActionReload": "다시 불러오기",
         "errorActionNewSession": "새 대화",
+        "errorActionCopyCommand": "명령 복사",
+        "errorActionCommandCopied": "복사됨",
         "emptyConversation": "이 대화에는 메시지가 없습니다.",
         "systemMessage": "시스템 메시지",
         "copyMessage": "복사",
@@ -3111,6 +3166,9 @@
         "tokenCacheRead": "캐시 읽기",
         "tokenCacheWrite": "캐시 쓰기",
         "duration": "소요 시간",
+        "worked": "작업 완료",
+        "workedFor": "{duration} 동안 작업함",
+        "working": "작업 중...",
         "completedAt": "완료 시각",
         "jumpToPreviousUserMessage": "이전 사용자 메시지로 이동",
         "showMore": "더보기",
@@ -5283,6 +5341,7 @@
     "commentUnknownAuthor": "알 수 없음",
     "commentEmptyBody": "(빈 댓글)",
     "commentPlaceholder": "댓글을 입력하세요…",
+    "commentAs": "{name}(으)로 댓글 작성",
     "commentSubmit": "댓글 작성",
     "commentSubmitting": "게시 중…",
     "closeItem": "닫기",

@@ -75,6 +75,7 @@ import {
   PetFocusBridge,
 } from "@/components/workspace/deep-link-bootstrap"
 import { WorkspaceOpenFolderListener } from "@/components/workspace/workspace-open-folder-listener"
+import { RemoteWorkspaceOpenFolderListener } from "@/components/workspace/remote-workspace-open-folder-listener"
 import { HeavyPluginsWarmup } from "@/components/ai-elements/heavy-plugins-warmup"
 import {
   ResizableHandle,
@@ -651,7 +652,7 @@ function MobileFolderWorkspaceShell({
       >
         <DrawerContent
           showCloseButton={false}
-          className="w-[85%] max-w-[360px] p-0"
+          className="w-[85%] max-w-[22.5rem] p-0"
         >
           <DrawerTitle className="sr-only">Sidebar</DrawerTitle>
           <Sidebar />
@@ -670,7 +671,7 @@ function MobileFolderWorkspaceShell({
       >
         <DrawerContent
           showCloseButton={false}
-          className="w-[85%] max-w-[360px] p-0"
+          className="w-[85%] max-w-[22.5rem] p-0"
         >
           <DrawerTitle className="sr-only">Panel</DrawerTitle>
           <AuxPanel />
@@ -1297,6 +1298,7 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                                           listener calls openConversations() to
                                           surface a launcher-opened folder. */}
                                     <WorkspaceOpenFolderListener />
+                                    <RemoteWorkspaceOpenFolderListener />
                                     <FolderLayoutShell>
                                       {children}
                                     </FolderLayoutShell>

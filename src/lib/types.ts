@@ -201,6 +201,8 @@ export type ContentBlock =
       revised_prompt?: string | null
       image?: ImageData | null
       status?: ToolCallStatus | null
+      /** Real tool/page name when this card is not Codex image generation. */
+      label?: string | null
     }
   | {
       type: "tool_use"
@@ -1527,6 +1529,10 @@ export interface ForgeIssueRow {
   draft: boolean
   labels: ForgeLabel[]
   author: string | null
+  /** The author's picture, `http(s)` only — under the same rule (and from the
+   *  same sanitizer) as `ForgeComment.author_avatar`. Rides along with the list
+   *  row on both forges, so the panel's author avatar costs no request. */
+  author_avatar: string | null
   updated_at: string | null
   html_url: string
   is_pr: boolean
@@ -1556,6 +1562,18 @@ export interface ForgeIssueList {
   has_next: boolean
   /** GitHub search timed out; this page is partial. */
   incomplete: boolean
+}
+
+/** Who a write against a folder goes out as (mirrors Rust ForgeIdentity).
+ *
+ *  Resolved by the backend from the origin remote's host and an optional
+ *  pinned account — the panel has no way to work it out, and the default
+ *  account would be the wrong answer on any folder that is not on it.
+ *  Deliberately carries no token: it is derived from the value that holds one. */
+export interface ForgeIdentity {
+  username: string
+  /** `http(s)` only, like every other avatar the panel renders. */
+  avatar_url: string | null
 }
 
 /** One human comment on a work item (mirrors Rust ForgeComment).
@@ -2371,7 +2389,10 @@ export type AcpEvent =
       type: "session_load_failed"
       session_id: string
       message: string
-      /** Stable backend identifier — currently `"resource_not_found"`. */
+      /**
+       * Stable backend identifier: `"resource_not_found"`,
+       * `"session_unavailable"`, or `"session_archived"`.
+       */
       code: string
     }
   | {
