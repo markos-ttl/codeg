@@ -197,7 +197,8 @@ interface ConversationTabViewProps {
    *  so tens of MB across a large tab set — before the user had looked at a
    *  single one of them. A hidden tab now fetches on the first frame it
    *  becomes visible, so the workspace opens fetching only the tabs on screen
-   *  (one per split group, or every member of a tiled one) instead of all N. */
+   *  (one per split group, or every member of a tiled one) instead of all N.
+   *  Only that first load waits: see the fetch gate in the view. */
   isVisible: boolean
 }
 
@@ -513,13 +514,30 @@ const ConversationTabView = memo(function ConversationTabView({
   // renders an empty transcript behind `invisible`, costing nothing. The
   // render that first shows it already reports `detailLoading` (the hook
   // counts a fetch it is about to start as loading) — that is what keeps
-  // `awaitingHistoricalSessionId` below closed on that render.
+  // `awaitingHistoricalSessionId` below closed on that render. `isActive` is in
+  // the gate as well, so that holds without leaning on the tab store always
+  // keeping the active tab its group's selected one.
+  //
+  // Only the FIRST load waits. Once this view has held a detail it fetches the
+  // way every view did before the gate, on screen or not. A hidden view can
+  // lose its session (closing the sub-agent viewer drops the session it shares
+  // with an open tab), and if the tab holds a live connection, the next
+  // streamed batch recreates that session with live data and no detail, which
+  // `fetchDetail` then never fills in: the tab came back without its history.
+  // Refetching straight away, as before, normally starts ahead of that batch.
+  // Latched on a held detail rather than on having been shown, so a view
+  // remounted while hidden onto a session that is already loaded (a move to
+  // another group) keeps it loaded too.
+  const [heldDetail, setHeldDetail] = useState(false)
   const {
     detail,
     loading: detailLoading,
     error: detailError,
     acpLoadError,
-  } = useConversationDetail(effectiveConversationId, { enabled: isVisible })
+  } = useConversationDetail(effectiveConversationId, {
+    enabled: isVisible || isActive || heldDetail,
+  })
+  if (detail != null && !heldDetail) setHeldDetail(true)
 
   // Subscribe to only the fields this panel actually reads from its runtime
   // session — NOT the whole session object. The live-message sink rewrites the
