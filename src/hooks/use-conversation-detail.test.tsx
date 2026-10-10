@@ -1,8 +1,9 @@
 import { act, cleanup, renderHook } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
-import type { DbConversationDetail } from "@/lib/types"
+import type { DbConversationDetail, MessageTurn } from "@/lib/types"
 import {
+  type ConversationRuntimeSession,
   resetConversationRuntimeStore,
   TAIL_TURNS_DEFAULT,
   useConversationRuntimeStore,
@@ -24,7 +25,10 @@ const mockGet = vi.mocked(getFolderConversation)
 
 const CID = 77
 
-function seedSession(detail: DbConversationDetail | null) {
+function seedSession(
+  detail: DbConversationDetail | null,
+  overrides: Partial<ConversationRuntimeSession> = {}
+) {
   useConversationRuntimeStore.setState({
     byConversationId: new Map([
       [
@@ -55,6 +59,7 @@ function seedSession(detail: DbConversationDetail | null) {
           olderTurnsPrependEpoch: 0,
           pendingOutOfTurnContent: false,
           pendingCleanup: false,
+          ...overrides,
         },
       ],
     ]),
@@ -70,6 +75,14 @@ const liveMsg = (id: string): LiveMessage => ({
   content: [],
   startedAt: 0,
 })
+
+const turn = (role: "user" | "assistant"): MessageTurn =>
+  ({
+    id: `${role}-1`,
+    role,
+    blocks: [],
+    timestamp: "2026-10-10T00:00:00Z",
+  }) as unknown as MessageTurn
 
 // `useConversationDetail` is one of the two runtime-store subscriptions the
 // keep-alive conversation panel (`ConversationTabView`) makes for its own
@@ -217,19 +230,22 @@ describe("useConversationDetail visibility gating", () => {
   // The pending-fetch half of `loading` must follow `fetchDetail`'s own skip
   // rule exactly: a session an ongoing turn holds is never fetched, so
   // reporting it as loading would hold the panel's connect gate shut forever.
-  it("does not report a fetch it will not make as loading", () => {
-    act(() => {
-      useConversationRuntimeStore
-        .getState()
-        .actions.setLiveMessage(CID, liveMsg("m1"), true)
-    })
+  it.each<[string, Partial<ConversationRuntimeSession>]>([
+    ["a live stream", { liveMessage: liveMsg("m1") }],
+    ["an optimistic prompt", { optimisticTurns: [turn("user")] }],
+    ["promoted local turns", { localTurns: [turn("assistant")] }],
+  ])(
+    "does not report a fetch it will not make as loading (%s)",
+    (_holder, holds) => {
+      act(() => seedSession(null, holds))
 
-    const { result } = renderHook(() => useConversationDetail(CID))
+      const { result } = renderHook(() => useConversationDetail(CID))
 
-    expect(result.current.loading).toBe(false)
-    expect(result.current.detail).toBeNull()
-    expect(mockGet).not.toHaveBeenCalled()
-  })
+      expect(result.current.loading).toBe(false)
+      expect(result.current.detail).toBeNull()
+      expect(mockGet).not.toHaveBeenCalled()
+    }
+  )
 })
 
 // A failed fetch leaves no detail and nothing in flight — exactly what the

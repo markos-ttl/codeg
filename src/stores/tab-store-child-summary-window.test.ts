@@ -82,5 +82,14 @@ describe("child-tab summary seeding", () => {
 
     await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(1))
     expect(mockGet).toHaveBeenCalledWith(CHILD_ID, { tailTurns: 1 })
+    // …and the windowed response still seeds the tab from its summary.
+    await vi.waitFor(() =>
+      expect(useTabStore.getState().childSummaries.get(CHILD_ID)).toBe(
+        childSummary
+      )
+    )
+    expect(
+      useTabStore.getState().tabs.find((tab) => tab.id === "child-1")?.title
+    ).toBe("child session")
   })
 })
