@@ -2113,6 +2113,8 @@
     "conversationCard": {
       "untitledConversation": "Conversa sem título",
       "newConversation": "Nova conversa",
+      "maximize": "Maximizar",
+      "restore": "Restaurar",
       "attachToCurrentSession": "Adicionar à sessão",
       "rename": "Renomear",
       "status": "Status",

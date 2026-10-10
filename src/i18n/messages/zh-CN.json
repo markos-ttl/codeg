@@ -2113,6 +2113,8 @@
     "conversationCard": {
       "untitledConversation": "未命名会话",
       "newConversation": "新建会话",
+      "maximize": "最大化",
+      "restore": "还原",
       "attachToCurrentSession": "添加到会话",
       "rename": "重命名",
       "status": "状态",

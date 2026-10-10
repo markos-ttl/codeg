@@ -2521,23 +2521,24 @@ const GROUP_EDGE_EPSILON = 0.1
  * exactly what the unsplit strip row does: left for LeftEdgeChrome while the
  * sidebar is collapsed (the conversation column then owns the window's left
  * edge), right for RightEdgeChrome while the column owns the right edge (aux
- * panel closed + conversation mode). Like that row, the reserve is mounted
- * while its column holds the corner — the right one only in conversation mode;
- * a mode switch snaps the layout — and sized by the side panel over the corner,
- * so a sidebar/aux toggle slides it (ChromeReserve). Mobile shows the
- * full-width FolderTitleBar instead of corner overlays — no reserve.
- * Self-subscribed so sidebar/aux/zoom toggles re-render these slivers, not the
- * whole panel.
+ * panel closed + conversation mode, or the column maximized over the file
+ * column). Like that row, the reserve is mounted while its column holds the
+ * corner — the right one only then; a mode switch or a maximize toggle snaps
+ * the layout — and sized by the side panel over the corner, so a sidebar/aux
+ * toggle slides it (ChromeReserve). Mobile shows the full-width FolderTitleBar
+ * instead of corner overlays — no reserve. Self-subscribed so sidebar/aux/zoom
+ * toggles re-render these slivers, not the whole panel.
  */
 function SplitStripCornerReserve({ side }: { side: "left" | "right" }) {
   const isMobile = useIsMobile()
   const { isOpen: sidebarOpen } = useSidebarContext()
   const { isOpen: auxOpen } = useAuxPanelContext()
-  const { mode } = useWorkspaceView()
+  const { mode, conversationMaximized } = useWorkspaceView()
   const { isMac, isWindows, isLinux } = usePlatform()
   const { zoomLevel } = useZoomLevel()
   if (isMobile) return null
-  if (side === "right" && mode !== "conversation") return null
+  const holdsRight = mode === "conversation" || conversationMaximized
+  if (side === "right" && !holdsRight) return null
   const width =
     side === "left"
       ? sidebarOpen
@@ -2992,11 +2993,13 @@ export function ConversationDetailPanel() {
       >
         {/* While split, each group owns its own strip (the workspace layout's
             title-bar row is gone entirely), and the TOP-edge strips add the
-            corner reserves that row normally carries. */}
+            corner reserves that row normally carries. The top-right one also
+            takes over the unsplit strip's maximize/restore button — the
+            column has one, so only one strip may carry it. */}
         {isSplit && (
           <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
             {touchesLeft && <SplitStripCornerReserve side="left" />}
-            <TabBar groupId={groupId} />
+            <TabBar groupId={groupId} maximizeControl={touchesRight} />
             {touchesRight && <SplitStripCornerReserve side="right" />}
           </div>
         )}

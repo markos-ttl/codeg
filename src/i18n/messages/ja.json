@@ -2113,6 +2113,8 @@
     "conversationCard": {
       "untitledConversation": "無題の会話",
       "newConversation": "新しい会話",
+      "maximize": "最大化",
+      "restore": "元に戻す",
       "attachToCurrentSession": "セッションに追加",
       "rename": "名前を変更",
       "status": "ステータス",

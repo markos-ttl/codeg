@@ -2113,6 +2113,8 @@
     "conversationCard": {
       "untitledConversation": "제목 없는 대화",
       "newConversation": "새 대화",
+      "maximize": "최대화",
+      "restore": "복원",
       "attachToCurrentSession": "세션에 추가",
       "rename": "이름 변경",
       "status": "상태",
