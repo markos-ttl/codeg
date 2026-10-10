@@ -393,7 +393,7 @@ pub const PI_MIN_RUNTIME_VERSION: &str = "0.81.0";
 
 /// The npm package the built-in Claude Code entry runs — and the name the
 /// adapter reports as `agentInfo.name` at `initialize`, which is its
-/// `packageJson.name` (read from the 0.58.1 to 0.88.0 sources). A custom agent
+/// `packageJson.name` (read from the 0.58.1 to 0.89.1 sources). A custom agent
 /// whose running adapter reports exactly this name follows the Claude Code
 /// steering policy (`connection.rs::steering_policy_agent`).
 pub const CLAUDE_AGENT_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
@@ -1999,9 +1999,67 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // recreates live sessions on the ACP `logout`, which codeg never
             // sends to Claude, and #1288–#1290 change the experimental ACP v2
             // surface only.
+            //
+            // 0.89.1 changes the adapter's session index only (#1293). Its
+            // dependencies are 0.89.0's exactly (the Claude SDK 0.3.293, so the
+            // CLI binary is byte for byte the same 2.1.293; the ACP SDK 1.8.0)
+            // and `engines.node` stays ">=22". The published package differs
+            // from 0.89.0's in `dist/session-index/*` and `package.json`, as
+            // the tag diff does. Each tag's scenario harness, run with codeg's
+            // exact `clientCapabilities`, is byte-identical in all 40
+            // scenarios, `initialize` included. A live conversation against the
+            // local fake Anthropic API (a new session, three turns, then a
+            // resume in a fresh process and a turn) sends the same ACP frames
+            // in the same order on both, apart from timing and paths.
+            //
+            // (ppp) #1293 sends a session this connection renamed, archived,
+            // unarchived or deleted to a `_session/list/subscribe` subscriber
+            // at once; lets the page after a `session/list` cursor reuse the
+            // previous page's enumeration for up to 30 s while no listed
+            // directory changed; and reads each listed transcript's titles
+            // itself rather than through the SDK's `getSessionInfo`, whose
+            // lookup listed the whole project directory per row and could read
+            // another copy of the session. All of it serves a client that
+            // declared `sessionIndex` (see (lll)), or the archive behind an
+            // AIR client's `session/delete`, which has no subscriber. codeg
+            // declares neither and sends none of these requests.
+            //
+            // (qqq) The rule the index now applies itself is the SDK's title
+            // rule, which the live `session_info_update.title` follows too:
+            // the custom title (the last in the transcript's last 64 KB, cut
+            // line included, then the `<session id>/custom-title.json` sidecar
+            // the CLI writes beside the transcript, then the first 64 KB),
+            // else the AI title, else the newest `last-prompt` record, a
+            // `summary` record or the first prompt. The adapter then collapses
+            // white space and cuts at 256 UTF-16 units (`sanitizeTitle`).
+            // codeg's history parser titles an untitled session by its first
+            // prompt, reference links folded, and both of codeg's transcript
+            // readers keep a stored title's spacing. Measured with the CLI's
+            // title request refused (a gateway may refuse it), adopting the
+            // wire title flipped the row against every detail fetch: after
+            // the first turn the wire published "Fix the login flow please
+            // look at [auth.ts](file:///tmp/auth.ts) first" (the `last-prompt`
+            // record of a two-line prompt with a file mention), on the next
+            // two turns nothing (this run's CLI rewrote that record after
+            // each process's first turn and at exit), after a resume and a turn
+            // "and one more turn after resume", while the parser read "Fix the
+            // login flow\n\nplease  look at auth.ts first" throughout. A
+            // generated title that came back with a double space was stored
+            // with it as an `ai-title` record and published collapsed. So for
+            // Claude codeg no longer writes the wire title while it can read
+            // the transcript: the notification loop holds it and wakes the
+            // transcript watcher, which drops it, publishing it only while it
+            // has no transcript it can read, as with a `CLAUDE_CONFIG_DIR` set
+            // only in the agent's environment
+            // (`session_title::accept_wire_title`). Every title the wire
+            // reports apart from that fallback is a transcript record too: the
+            // CLI appends a custom title before it writes the sidecar, and
+            // stores a generated one as an `ai-title` record.
+            // codeg keeps its first-prompt fallback; showing the SDK's newest
+            // prompt instead would be a separate choice.
             distribution: AgentDistribution::Npx {
-                version: "0.89.0",
-                package: "@agentclientprotocol/claude-agent-acp@0.89.0",
+                version: "0.89.1",
+                package: "@agentclientprotocol/claude-agent-acp@0.89.1",
                 cmd: "claude-agent-acp",
                 args: &[],
                 env: &[],
@@ -4529,8 +4587,8 @@ mod tests {
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
             AgentType::ClaudeCode,
-            "0.89.0",
-            "@agentclientprotocol/claude-agent-acp@0.89.0",
+            "0.89.1",
+            "@agentclientprotocol/claude-agent-acp@0.89.1",
             Some("22.0.0"),
         );
         assert_npx_version(

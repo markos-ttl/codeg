@@ -18098,14 +18098,18 @@ async fn emit_conversation_update(
             // whose own transcript carries the name (Codex's session index,
             // Claude's `ai-title`) — a custom ACP agent's is gone, because
             // `parsers/acp_native.rs` records no `session_info_update` and can
-            // only ever title a session by its first prompt.
+            // only ever title a session by its first prompt. Claude Code's is
+            // not written here at all: it is held for the transcript watcher,
+            // which writes the transcript's own titles instead whenever it can
+            // read the transcript (`session_title::accept_wire_title`).
             if let Some(title) = crate::acp::session_title::native_title_from_session_info(
                 info.title.value().map(|s| s.as_str()),
             ) {
                 // Shared with the transcript watcher's title path so the
                 // skip-cache and the unbound-row drop have exactly one
                 // spelling — see `session_title::publish_native_title`.
-                crate::acp::session_title::publish_native_title(state, emitter, title).await;
+                crate::acp::session_title::accept_wire_title(state, emitter, agent_type, title)
+                    .await;
             }
             let neutral_goal_channel = state.read().await.neutral_goal_channel;
             if let Some(goal) =
@@ -19431,6 +19435,15 @@ mod tests {
     /// Drive one `session_info_update` carrying `title` through
     /// `emit_conversation_update`.
     async fn drive_session_info_title(state: &Arc<RwLock<SessionState>>, title: &str) {
+        drive_session_info_title_from(state, AgentType::CodeBuddy, title).await;
+    }
+
+    /// [`drive_session_info_title`] for `agent_type`.
+    async fn drive_session_info_title_from(
+        state: &Arc<RwLock<SessionState>>,
+        agent_type: AgentType,
+        title: &str,
+    ) {
         let update: SessionUpdate = serde_json::from_value(serde_json::json!({
             "sessionUpdate": "session_info_update",
             "title": title,
@@ -19441,7 +19454,7 @@ mod tests {
         emit_conversation_update(
             state,
             &EventEmitter::Noop,
-            AgentType::CodeBuddy,
+            agent_type,
             update,
             None,
             &mut cache,
@@ -19534,6 +19547,32 @@ mod tests {
             vec!["Fix the login flow".to_string()],
             "the same title must be accepted once the row exists"
         );
+    }
+
+    /// Claude Code's live title is not written from the wire: when the CLI
+    /// cannot generate a title, claude-agent-acp publishes the session's
+    /// newest `last-prompt` record instead (measured on 0.89.1, registry
+    /// (qqq)), which the history parser never produces, so writing it would
+    /// flip the row on every detail fetch. It is held, normalized, for the
+    /// transcript watcher (`session_title::release_held_wire_title`).
+    #[tokio::test]
+    async fn a_claude_session_info_title_is_held_for_the_transcript_watcher() {
+        let state = title_test_state(Some(7));
+
+        drive_session_info_title_from(
+            &state,
+            AgentType::ClaudeCode,
+            "  Fix the login flow please look at [auth.ts](file:///tmp/auth.ts) first ",
+        )
+        .await;
+
+        assert!(emitted_native_titles(&state).await.is_empty());
+        let s = state.read().await;
+        assert_eq!(
+            s.held_wire_title.as_deref(),
+            Some("Fix the login flow please look at [auth.ts](file:///tmp/auth.ts) first")
+        );
+        assert!(s.last_native_title.is_none());
     }
 
     /// Goal-only / metadata-only `session_info_update`s (the common case for
