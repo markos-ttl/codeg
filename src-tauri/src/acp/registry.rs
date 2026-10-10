@@ -3128,25 +3128,39 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             supports_mcp: true,
             name: "Cline",
             description: "Autonomous coding agent CLI",
-            // 3.0.66 moved cline's build from Bun 1.3.13 to 1.4.2, and its
-            // darwin binaries pass `codesign --verify --strict` (3.0.68's
-            // darwin-arm64 binary still does, still on Bun 1.4.2). The earlier
-            // pins checked (3.0.55, 3.0.60–3.0.65) all shipped Bun's broken
-            // ad-hoc signature (the last, partial page hashed as if
-            // zero-padded), and macOS 27 SIGKILLs such a binary when its exit
-            // path reads that page (`atexit` → `dladdr`): there even
+            // 3.0.66 moved cline's build from Bun 1.3.13 to 1.4.2, and from
+            // then on its darwin-arm64 binary passes `codesign --verify
+            // --strict` (3.0.70's still does, still on Bun 1.4.2). Its
+            // darwin-x64 binary fails that check from 3.0.66 through 3.0.70: it
+            // keeps the Developer ID signature of Bun's own runtime over a file
+            // that no longer matches it; whether macOS kills it was not tested.
+            // The earlier pins checked (3.0.55, 3.0.60–3.0.65) all shipped
+            // Bun's broken ad-hoc signature (the last, partial page hashed as
+            // if zero-padded), and macOS 27 SIGKILLs such a binary when its
+            // exit path reads that page (`atexit` → `dladdr`): there even
             // `cline --version` exited 137, and ACP sessions died within a
-            // second of `initialize`. The ACP surface is unchanged in 3.0.68:
-            // `apps/cli/src` has no diff since 3.0.67 (`apps/cli/src/acp` none
-            // since 3.0.65), and `initialize` / `session/new` match 3.0.67 but
-            // for the version. Its SDK changes are agent-team persistence,
-            // which `--acp` never enables (`enableAgentTeams: false`), and a
-            // model-catalog refresh that moves ten providers' fallback default
-            // model. What moved for codeg in 3.0.66 is token accounting; see
-            // `outputTokens` in `parsers::cline`.
+            // second of `initialize`.
+            //
+            // The ACP surface is unchanged in 3.0.70: `apps/cli/src/acp` has
+            // no diff since 3.0.65, the rest of `apps/cli/src` changed since
+            // 3.0.68 only in subcommands and flags codeg does not pass, `--acp`
+            // still sets `enableAgentTeams: false`, and `initialize` /
+            // `session/new` match 3.0.68 but for the version (and, under the
+            // `cline` provider, a refreshed model catalog). What moved for
+            // codeg is in the SDK. Since 3.0.69 a reply whose finish reason the
+            // AI SDK does not recognise is continued once, and the nudge cline
+            // sends for it ("Previous turn ended unexpectedly. Continue from
+            // where you left off.") is persisted as a `role:"user"` message
+            // flagged `displayRole: "system"`, which `parsers::cline` now keeps
+            // out of the transcript along with cline's other model-only
+            // messages; live, the two halves arrive as one message. 3.0.69 also
+            // raised the stdio MCP connect budget from 3 s to 10 s
+            // (`DEFAULT_MCP_CONNECT_TIMEOUT_MS`), which gives the codeg-mcp
+            // companion more headroom. What moved in 3.0.66 is token
+            // accounting; see `outputTokens` in `parsers::cline`.
             distribution: AgentDistribution::Npx {
-                version: "3.0.68",
-                package: "cline@3.0.68",
+                version: "3.0.70",
+                package: "cline@3.0.70",
                 cmd: "cline",
                 args: &["--acp"],
                 env: &[],
@@ -3226,50 +3240,60 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // Docker / Nix are the supported channels. The npm `hermes-agent`
             // package is a COMMUNITY bridge (wyrtensi/hermes-agent-npm, not
             // Nous Research), pinned here at an exact, audited version: its
-            // postinstall clones the OFFICIAL repo at tag v2026.9.24 verifying
-            // the full commit SHA (f97608f1…), bootstraps an isolated Python
-            // 3.11 venv with a checksum-pinned uv, and `uv sync --frozen
-            // --extra all` (⊇ the acp+mcp extras) from upstream's lockfile —
-            // all inside the npm package directory; config/credentials stay in
-            // `~/.hermes`. Its `hermes` bin execs the venv's real upstream
-            // console script, so `hermes acp` is the same adapter the official
-            // install runs. Keep the pin EXACT on version bumps and re-audit
-            // the wrapper diff — the exact pin is what bounds the third-party
-            // trust surface. 0.21.4 audited: the whole of `lib/` (incl.
-            // `uv-installer.js` and its uv 0.12.13 digest table) and `bin/` are
-            // byte-identical to the audited 0.21.3, and `package.json` moves
-            // only the version and the upstream pin. The one code change is in
-            // `scripts/postinstall.js`, and it is a single argument:
-            // `uv sync --locked` → `--frozen`. Both install strictly from
-            // upstream's `uv.lock` with its per-artifact hashes and neither
-            // re-resolves; `--frozen` drops only the assertion that the lock is
-            // in sync with `pyproject.toml`, a check whose strictness varies by
-            // uv version. Since the checkout is pinned to an exact commit, that
-            // lockfile is fixed content — so the installed dependency set stays
-            // exactly as pinned, and `fetchAndVerifyPinnedTag` still hard-compares
-            // `rev-parse <tag>^{commit}` against the 40-hex pin before the
-            // `checkout --detach`. That new pin resolves as advertised: the
-            // annotated tag v2026.9.21 dereferences to exactly d337b736…, tagged
-            // by Teknium on 2026-09-21. 0.21.5 audited: every file but
-            // `package.json` is byte-identical to 0.21.4 (so the install path
-            // above is unchanged — what it installs is the new commit's
-            // `uv.lock`, which upstream did move), and `package.json` moves
-            // only the version and the upstream pin — the annotated tag
-            // v2026.9.24 dereferences to exactly f97608f1…, tagged by Teknium
-            // on 2026-09-24.
+            // postinstall clones the OFFICIAL repo at tag v0.21.6 verifying the
+            // full commit SHA (818c13be…), bootstraps an isolated, uv-managed
+            // Python 3.14 venv with a checksum-pinned uv, and runs `uv sync
+            // --frozen --extra all --no-dev` (⊇ the acp+mcp extras) from
+            // upstream's lockfile — all inside the npm package directory;
+            // config/credentials stay in `~/.hermes`. Its `hermes` bin execs
+            // the venv's real upstream console script, so `hermes acp` is the
+            // same adapter the official install runs. Keep the pin EXACT on
+            // version bumps and re-audit the wrapper diff — the exact pin is
+            // what bounds the third-party trust surface. `--frozen` (since
+            // 0.21.4, which replaced `--locked`) still installs strictly from
+            // upstream's `uv.lock` with its per-artifact hashes and never
+            // re-resolves; it only skips the assertion that the lock is in sync
+            // with `pyproject.toml`, a check whose strictness varies by uv
+            // version. Since the checkout is pinned to an exact commit, that
+            // lockfile is fixed content, so the installed dependency set is
+            // exactly the pinned one, and `fetchAndVerifyPinnedTag` still
+            // hard-compares `rev-parse <tag>^{commit}` against the 40-hex pin
+            // before the `checkout --detach`.
             //
-            // Upstream's own `acp_adapter/` delta for v2026.9.24 changes how a
-            // fresh session picks its toolsets: through the same per-platform
-            // resolver the CLI and gateway use, so `platform_toolsets.acp` and
-            // `agent.disabled_toolsets` now apply, and with neither set the
-            // `hermes-acp` default is filtered through that resolver's
-            // default-off list. codeg writes neither key. What codeg relies on
-            // is unmoved: every enabled `mcp_servers` entry is still switched
-            // on by default, and servers handed over on `session/new`
-            // (codeg-mcp included) are still appended unconditionally as
-            // `mcp-<name>`. The only other change is a recovery hook for an
-            // interrupted `hermes update` in the standalone `hermes-acp` entry,
-            // a no-op under the `hermes acp` codeg launches.
+            // 0.21.6 audited: `scripts/postinstall.js`, `bin/` and every
+            // install-path file in `lib/` (including `uv-installer.js` and its
+            // uv 0.12.13 digest table) are byte-identical to 0.21.5.
+            // `package.json` moves the version and the upstream pin and raises
+            // `pythonVersion` from 3.11 to 3.14, which upstream's lockfile now
+            // admits (`requires-python` `<3.15`); the install marker keys on
+            // both, so upgrading rebuilds the checkout and its venv. The three
+            // other changed files are the README, help text, and the opt-in
+            // `hermes-npm migrate upstream` handoff, whose official-installer
+            // stage now comes from `package.json` (`installerFinalizeStage:
+            // "products"`). Upstream moved to semver release tags: the annotated
+            // tag v0.21.6 dereferences to exactly 818c13be…, tagged by "Hermes
+            // Release Automation" on 2026-10-08 (unsigned) for the release
+            // teknium1 published. Its `uv.lock` gained 70 packages, but on
+            // macOS arm64 `--extra all` installs 106 of them (103 before).
+            //
+            // Upstream's `acp_adapter/` delta since v2026.9.24 reaches codeg in
+            // one place. At stdio shutdown the adapter now stamps `ended_at`
+            // (`end_reason = 'acp_disconnect'`) on every session it holds, and
+            // `session/load` / `session/resume` clear it, so the column no
+            // longer means the transcript's end; `parsers::hermes` reads a
+            // session's last activity from its newest message instead. The rest
+            // leaves codeg's assumptions standing: the per-platform toolset
+            // resolver (`platform_toolsets.acp`, `agent.disabled_toolsets`;
+            // codeg writes neither), every enabled `mcp_servers` entry switched
+            // on by default, and servers handed over on `session/new` (codeg-mcp
+            // included) appended unconditionally as `mcp-<name>`. A fresh
+            // session's default toolset now also carries six browser and
+            // password-vault tools (`browser_exec`, `browser_vault_*`), the
+            // adapter installs the OS trust store before any outbound call, and
+            // `agentInfo.version` comes from release metadata (still "0.21.6").
+            // `state.db` moves to schema 31 by adding columns only, and a
+            // literal message that begins with the `\x00json:` content sentinel
+            // is now stored escaped, which `parsers::hermes` decodes as text.
             //
             // Launch preference: `resolve_npx_command("hermes")` checks PATH,
             // then `~/.local/bin` (the official installer's target), then the
@@ -3279,8 +3303,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // `~/.local/bin`. The npm global install is the managed/one-click
             // channel codeg's Install button drives.
             distribution: AgentDistribution::Npx {
-                version: "0.21.5",
-                package: "hermes-agent@0.21.5",
+                version: "0.21.6",
+                package: "hermes-agent@0.21.6",
                 cmd: "hermes",
                 args: &["acp"],
                 env: &[],
@@ -3300,19 +3324,36 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // 'esbuild'"); codeg's own `npm install -g` passes
             // `--include=optional`, so managed installs always had it. 2.161.3
             // dropped `esbuild` entirely (no dependency lists it, no bundle
-            // loads it), and 2.161.4 answers `initialize` from an install
-            // without it. The `@agentclientprotocol/sdk` and
-            // `@openai/agents-core` dependencies are still type-only, and
+            // loads it), and 2.164.0 still answers `initialize` from an install
+            // without optional dependencies. The `@agentclientprotocol/sdk` and
+            // `@openai/agents-core` dependencies are still type-only. `--acp`
+            // runs `dist/codebuddy-headless.js`, which the launcher picks for
+            // it, not `dist/codebuddy.js`.
+            //
+            // 2.162.0 through 2.164.0 leave the wire codeg reads alone:
             // `initialize` and the unauthenticated `session/new` answer match
-            // 2.161.0. What moved on the wire is argument streaming: those
-            // `tool_call_update` frames now carry the sub-agent link
+            // 2.161.4, no `sessionUpdate` kind or `session/*` method came or
+            // went, and argument streaming is the same code. Those
+            // `tool_call_update` frames carry the sub-agent link
             // (`codebuddy.ai/parentToolCallId`) inside `_meta`, where codeg
-            // nests child calls from, instead of on the update itself; and
-            // after a call's first frame they are merged over a 100 ms window,
-            // each merged frame carrying the latest `rawInput` and `_meta`.
+            // nests child calls from, and after a call's first frame they are
+            // merged over a 100 ms window (flushed early at 64 KiB), each
+            // merged frame carrying the latest `rawInput` and `_meta`. Two
+            // changes reach the history parser. Task-list reminders for the
+            // model are now persisted as `<system-reminder>` user records
+            // flagged `isMeta`, which `parsers::codebuddy` drops like every
+            // injected record. And a custom model can now use the OpenAI
+            // Responses API, whose records carry the agents SDK's usage
+            // (`inputTokens` / `outputTokens`) where a Chat Completions model's
+            // carry the provider's `prompt_tokens` / `completion_tokens`; the
+            // parser reads both. Mods (function hooks) now load by default, and
+            // while loaded they send `_codebuddy.ai/modSlots` and
+            // `_codebuddy.ai/modRenderInvalidate` notifications to every
+            // connection; they name no session, so they are never parked for a
+            // session router, and codeg maps them to nothing.
             distribution: AgentDistribution::Npx {
-                version: "2.161.4",
-                package: "@tencent-ai/codebuddy-code@2.161.4",
+                version: "2.164.0",
+                package: "@tencent-ai/codebuddy-code@2.164.0",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -3651,26 +3692,42 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // `models` that the composer's selectors and context ring read, and
             // prompting straight after it works. It also skips `session/load`'s
             // history replay, which codeg only drained to discard. The 1.0.1–
-            // 1.0.46 patches add nothing further here: re-probed live against
-            // the 1.0.46 binary, `initialize` still answers
+            // 1.0.51 patches add nothing further here: re-probed live against
+            // the 1.0.51 binary (with 1.0.46 as the A/B; both refuse
+            // `session/new` and `session/resume` without a credential, so those
+            // ran with a placeholder `XAI_API_KEY`), `initialize` still answers
             // `sessionCapabilities: {list, resume, close}` plus the same
             // `promptCapabilities.embeddedContext` (and `mcpCapabilities`
             // http+sse, `loadSession: true`), and `session/resume` still
             // carries `x.ai/sessionConfig` and the per-model `models`, so the
-            // resume rung stands. All six `@xai-official/grok-<os>-<arch>`
-            // optional deps are published at 1.0.46 — they are OPTIONAL, so a
-            // platform that lags would fail only for that platform's users, at
-            // run time, in the trampoline. The pin tracks `dist-tags.latest`,
-            // NOT the highest version number; at 1.0.46 `latest` and `alpha`
-            // point at the same version, so nothing is staged ahead of it.
+            // resume rung stands. The one `_meta` change in those replies,
+            // `x.ai/memoryMode` giving way to `x.ai/memoryNotesWritable`, is a
+            // key codeg does not read; neither does it map the two status
+            // updates 1.0.50 added on `_x.ai/session/update`, `login_refused`
+            // (with a `remedy` text) and `backend_responsive`, any more than
+            // grok's other status updates. A session's directory, its
+            // `summary.json` keys and the `updates.jsonl` envelope are unchanged
+            // after a turn. All six `@xai-official/grok-<os>-<arch>` optional
+            // deps are published at 1.0.51 — they are OPTIONAL, so a platform
+            // that lags would fail only for that platform's users, at run time,
+            // in the trampoline. The pin normally tracks `dist-tags.latest`,
+            // NOT the highest version number. 1.0.51 is the exception: it was
+            // still npm's `alpha` when pinned (`latest` was 1.0.50), and what
+            // was checked shows nothing alpha-specific. Its `--version` carries
+            // no prerelease suffix, `grok update` still defaults to the stable
+            // channel, and the probed ACP answers match 1.0.50's apart from
+            // `x.ai/memoryNotesWritable`. Version Status offers no "upgrade"
+            // back to 1.0.50, since it only offers a strictly newer `latest`.
             //
             // One tool input codeg renders did change after 1.0.41:
             // `run_terminal_command` dropped `background` and `timeout` for
             // `block_until_ms` (how long to wait before backgrounding the
             // command: 30000 by default, 0 at once), so a grok shell card no
-            // longer has a timeout to show. A background launch still answers
-            // with the text "Background task <id> started", which is what
-            // codeg's launch matcher (`parseBackgroundLaunch`) reads.
+            // longer has a timeout to show; 1.0.51 still takes it. A background
+            // launch answers with the text "Background task <id> started"
+            // (seen live through 1.0.46; the literal is still in the 1.0.51
+            // binary), which is what codeg's launch matcher
+            // (`parseBackgroundLaunch`) reads.
             //
             // 1.0.40 DID add one thing that reaches codeg, and it needed a fix
             // on our side: it narrates `session/new` progress on the
@@ -3683,18 +3740,22 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // frame and it would sit in the retry queue for the connection's
             // life. `ClaimNullSessionIds` in connection.rs claims
             // those frames before they can be parked, so this bump is safe only
-            // together with that guard. 1.0.46 still sends exactly those five
-            // (`auth` … `mcp_merge`); the `agent_build` phase added since
-            // 1.0.41 comes after the id exists and carries it.
+            // together with that guard. 1.0.51 still sends exactly those five
+            // (`auth` … `mcp_merge`); every later phase, from
+            // `persistence_init` on (`agent_build` among them), carries the id.
+            // Since 1.0.50 `_x.ai/mcp/servers_updated`, which has no
+            // `sessionId` field at all, arrives before those phases instead of
+            // after the id exists. codeg does not read it, and a frame without
+            // the field is never parked, so the move changes nothing.
             distribution: AgentDistribution::Npx {
-                version: "1.0.46",
-                package: "@xai-official/grok@1.0.46",
+                version: "1.0.51",
+                package: "@xai-official/grok@1.0.51",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
                 // flags (`--no-auto-update` always, `--permission-mode <value>`
                 // only for a non-default permission mode) MUST precede this
                 // subcommand — `grok agent stdio` itself rejects them (re-verified
-                // against 1.0.46: it still only accepts --debug/--debug-file/
+                // against 1.0.51: it still only accepts --debug/--debug-file/
                 // --leader-socket) — so `build_agent` inserts them ahead of these
                 // args rather than appending after. Since 1.0.3 `grok --help` no
                 // longer LISTS `--no-auto-update`, but it is still accepted:
@@ -3705,7 +3766,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 // auto/dontAsk/bypassPermissions/plan).
                 args: &["agent", "stdio"],
                 env: &[],
-                // `@xai-official/grok@1.0.46` declares `engines.node: ">=20"`;
+                // `@xai-official/grok@1.0.51` declares `engines.node: ">=20"`;
                 // surface that in preflight so Node 18 isn't silently accepted.
                 node_required: Some("20.0.0"),
             },
@@ -3966,8 +4027,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // selectors need no per-agent code. The modes are default/
             // acceptEdits/auto/dontAsk/yolo, `yolo` being the one labelled
             // "Bypass Permissions" (`bypassPermissions` is accepted as an alias
-            // for it, `plan` is rejected) — re-read live on 1.1.64 and 1.1.65,
-            // and nothing in codeg names them. Session logs land as
+            // for it, `plan` is rejected) — re-read live on 1.1.64, 1.1.65 and
+            // 1.1.67, and nothing in codeg names them. Session logs land as
             // `$QODER_CONFIG_DIR/projects/<encoded-cwd>/<sessionId>.jsonl`
             // (default `~/.qoder/...`) in the Claude-Code-style chunk-log
             // envelope, which `parsers::qoder` reads for history — including
@@ -3975,6 +4036,22 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // name in plaintext (the sibling `<sessionId>/state.json` keeps its
             // own copy AES-GCM-encrypted under the machine key, so it is not
             // the source). `engines.node: ">=20"`.
+            //
+            // 1.1.66 and 1.1.67 change only the two bundles and the version
+            // strings (`postinstall.cjs` and the npm dispatcher are
+            // byte-identical). A live A/B against 1.1.65 under the CLI's
+            // `--fake-responses` replay gives identical `initialize`,
+            // `session/new`, `set_mode` and config-option answers, and a
+            // scripted turn writes the same transcript record types and
+            // shapes; `/rename` still writes a plaintext `custom-title` record
+            // (`ai-title` comes only from the interactive TUI, never an ACP
+            // session). The one protocol change is in 1.1.67: the
+            // `reasoning_effort` option moves from `category: "model"` to
+            // `"thought_level"`. codeg needs nothing for it: the model-label
+            // store finds the model selector by its `model` id first, the
+            // composer's model-only handling (search, provider groups) never
+            // applied to a short effort list, and saved preferences still
+            // replay `model` before the effort.
             //
             // `QODER_EXPOSE_TOKEN_USAGE` turns OFF qoder's own token-count
             // redaction, and without it every qoder session reports zero tokens
@@ -3993,7 +4070,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             //
             // The name is assembled at runtime from a `QODER_`/`QODERCN_`
             // prefix (`Sr(A) = `${vv}${A}``, `ebA = Sr("EXPOSE_TOKEN_USAGE")`
-            // in 1.1.54; the minified names change every build), so grepping
+            // in 1.1.54, `yr` / `CRA` in 1.1.67; the minified names change
+            // every build), so grepping
             // the bundle for the full literal returns nothing —
             // grep the bare suffix instead, the same trap `parsers::qoder`
             // documents for the config-dir vars.
@@ -4002,8 +4080,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // `runtime_env` override it, so a user who wants the redaction back
             // sets `QODER_EXPOSE_TOKEN_USAGE=0` in the agent's env settings.
             distribution: AgentDistribution::Npx {
-                version: "1.1.65",
-                package: "@qoder-ai/qodercli@1.1.65",
+                version: "1.1.67",
+                package: "@qoder-ai/qodercli@1.1.67",
                 cmd: "qoder",
                 args: &["--acp"],
                 env: &[("QODER_EXPOSE_TOKEN_USAGE", "1")],
@@ -4473,14 +4551,14 @@ mod tests {
         );
         assert_npx_version(
             AgentType::Cline,
-            "3.0.68",
-            "cline@3.0.68",
+            "3.0.70",
+            "cline@3.0.70",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.161.4",
-            "@tencent-ai/codebuddy-code@2.161.4",
+            "2.164.0",
+            "@tencent-ai/codebuddy-code@2.164.0",
             Some("22.0.0"),
         );
         // Kimi Code must never land on 0.37.0–0.38.0: every session in that
@@ -4500,8 +4578,8 @@ mod tests {
         assert_npx_version(AgentType::Pi, "0.0.34", "pi-acp@0.0.34", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
-            "1.0.46",
-            "@xai-official/grok@1.0.46",
+            "1.0.51",
+            "@xai-official/grok@1.0.51",
             Some("20.0.0"),
         );
         assert_npx_version(
@@ -4512,8 +4590,8 @@ mod tests {
         );
         assert_npx_version(
             AgentType::Qoder,
-            "1.1.65",
-            "@qoder-ai/qodercli@1.1.65",
+            "1.1.67",
+            "@qoder-ai/qodercli@1.1.67",
             Some("20.0.0"),
         );
         assert_binary_version(AgentType::OpenCode, "1.18.35", "/releases/download/v1.18.35/");
@@ -4523,8 +4601,8 @@ mod tests {
         // audited wrapper code is only what the pinned version ships.
         assert_npx_version(
             AgentType::Hermes,
-            "0.21.5",
-            "hermes-agent@0.21.5",
+            "0.21.6",
+            "hermes-agent@0.21.6",
             Some("20.0.0"),
         );
     }
