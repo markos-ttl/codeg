@@ -22,6 +22,15 @@ export function useConversationDetail(
      * the child's persisted detail while it is mid-stream (the parser surfaces
      * the in-progress turn as a normal turn, which would then duplicate the
      * live stream).
+     *
+     * Also pass `false` for a mounted-but-OFF-SCREEN view. The workspace keeps
+     * every open tab mounted (that is what preserves a background session's
+     * stream and scroll state), so an ungated hook fires one detail fetch per
+     * open tab as soon as the tab set is restored — N concurrent
+     * `get_folder_conversation` calls carrying tens of MB for a large tab set,
+     * before the user has looked at any of them. Flipping `enabled` to `true`
+     * (which is what a tab switch / group selection / tiling does) re-runs the
+     * effect and fetches then.
      */
     enabled?: boolean
   }

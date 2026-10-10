@@ -189,6 +189,16 @@ interface ConversationTabViewProps {
    *  reparent (the tab moved to another group — remount, keep the connection)
    *  apart from a real teardown (pane switch / route change — disconnect). */
   groupId: string
+  /** Whether this view is actually on screen: the active tab, or every member
+   *  of a tiled group. A mounted-but-hidden tab keeps its runtime session
+   *  alive, but it must NOT auto-fetch its own detail. Restoring a workspace
+   *  with N open tabs used to issue N concurrent `get_folder_conversation`
+   *  calls — each one a tail window of up to `TAIL_TURNS_DEFAULT` (120) turns,
+   *  so tens of MB across a large tab set — before the user had looked at a
+   *  single one of them. A hidden tab now fetches on the first frame it
+   *  becomes visible, so the workspace opens with one conversation in flight
+   *  instead of N. */
+  isVisible: boolean
 }
 
 function buildOptimisticUserTurnFromDraft(
@@ -255,6 +265,7 @@ const ConversationTabView = memo(function ConversationTabView({
   showActiveFlow,
   reloadSignal,
   groupId,
+  isVisible,
 }: ConversationTabViewProps) {
   const t = useTranslations("Folder.conversation")
   // Composer-namespace copy for the queue row's click-to-insert outcomes
@@ -492,12 +503,20 @@ const ConversationTabView = memo(function ConversationTabView({
     setAgentConnectError(null)
   }, [agentType, conversationId])
 
+  // Gate the auto-fetch on VISIBILITY, not on mount. Every open tab stays
+  // mounted (that is what keeps a background session's stream and scroll state
+  // alive), so an ungated hook here would fire one detail fetch per open tab
+  // the moment the workspace restores — the N-concurrent-requests /
+  // tens-of-MB first paint described on `isVisible`. A hidden tab's effect
+  // re-runs when `isVisible` flips true (tab switch, group selection, tiling),
+  // which is also the moment its detail is first needed; until then the panel
+  // renders its loading state behind `invisible`, costing nothing.
   const {
     detail,
     loading: detailLoading,
     error: detailError,
     acpLoadError,
-  } = useConversationDetail(effectiveConversationId)
+  } = useConversationDetail(effectiveConversationId, { enabled: isVisible })
 
   // Subscribe to only the fields this panel actually reads from its runtime
   // session — NOT the whole session object. The live-message sink rewrites the
@@ -2906,6 +2925,7 @@ export function ConversationDetailPanel() {
         showActiveFlow={(isSplit || canTileG) && active}
         reloadSignal={reloadByTabId[tab.id] ?? 0}
         groupId={groupId}
+        isVisible={visible}
       />
     )
     return (
