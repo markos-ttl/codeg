@@ -2953,6 +2953,11 @@ function isLatestGeneration(
 // trailing USER turn (Claude/Codex append the assistant reply to the JSONL only
 // on completion, so a trailing user turn means the reply is still mid-flush).
 const VIEWER_DETAIL_SYNC_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
+// A poll that finds a detail load the view started still in flight waits for
+// it in steps of this length, up to the cap, before it reads (see
+// `syncViewerDetail`).
+const VIEWER_DETAIL_SYNC_LOAD_WAIT_STEP_MS = 300
+const VIEWER_DETAIL_SYNC_LOAD_WAIT_CAP_MS = 30_000
 
 // ─── Post-turn metadata reparse ──────────────────────────────────────────
 // Backoff for `syncTurnMetadata`, which re-reads the agent's transcript after
@@ -3040,6 +3045,23 @@ function isPureViewerSession(session: ConversationRuntimeSession): boolean {
       session.localTurns.length > 0 &&
       (session.lastTurnOwned || session.liveOwnsActiveTurn)
     )
+  )
+}
+
+/**
+ * Whether a session already holds turns of an ongoing conversation (an
+ * optimistic prompt, a live stream, or promoted local turns). `fetchDetail`
+ * skips such a session, and `useConversationDetail` asks the same question to
+ * tell whether its auto-fetch is about to run — one predicate, so the hook can
+ * never report a fetch as pending that `fetchDetail` would then decline.
+ */
+export function sessionHoldsActiveTurns(
+  session: ConversationRuntimeSession
+): boolean {
+  return (
+    session.optimisticTurns.length > 0 ||
+    session.liveMessage !== null ||
+    session.localTurns.length > 0
   )
 }
 
@@ -3794,14 +3816,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (session?.detail || session?.detailLoading) return
 
     // Skip fetch if session has active data (ongoing conversation)
-    if (
-      session &&
-      (session.optimisticTurns.length > 0 ||
-        session.liveMessage !== null ||
-        session.localTurns.length > 0)
-    ) {
-      return
-    }
+    if (session && sessionHoldsActiveTurns(session)) return
 
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
@@ -3861,9 +3876,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
    * Load one page of older history above the current window and prepend it.
    * No-op unless the detail is windowed with `turns_offset > 0`, and single-
    * flight per session. Participates in the SAME fetch-generation total order
-   * as every other detail fetch: issuing a page invalidates any in-flight
-   * window refresh (whose response predates the page and would clobber it),
+   * as every other detail fetch: issuing a page invalidates an in-flight
+   * viewer-sync read (whose response predates the page and would clobber it),
    * and any fetch issued after the page invalidates the page.
+   *
+   * Never issued while a detail load is in flight (`detailLoading`: a reload,
+   * an overlay fold). Only that load's own result clears the flag, so a page
+   * invalidating it left the session loading for good: auto-connect held shut,
+   * overlay folds stopped. The load lands its window instead; the near-top
+   * trigger fires again the next time the list is scrolled up into the top,
+   * and the loader row pages on click.
    */
   const loadOlderTurns = (conversationId: number): void => {
     const session = get().byConversationId.get(conversationId)
@@ -3871,6 +3893,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (!session || !detail || !isWindowedDetail(detail)) return
     const beforeIndex = detail.turns_offset
     if (beforeIndex <= 0 || session.loadingOlderTurns) return
+    if (session.detailLoading) return
     const expectedSeamHash = detail.prefix_hash
     const fetchId = session.dbConversationId ?? conversationId
     const generation = bumpFetchGeneration(conversationId)
@@ -3911,7 +3934,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
   // rather than refetch once. No-op (returns immediately) unless the session is
   // open AND a pure viewer, so the owner's in-flight/just-completed reply is
   // never touched. Never sets `detailLoading` — a passive background sync must
-  // not flash a spinner over the content the viewer is already reading.
+  // not flash a spinner over the content the viewer is already reading — and
+  // never supersedes a load that did set it: it waits for that load instead.
   const syncViewerDetail = (nudgedConversationId: number): void => {
     // The nudge carries a positive DB id; map it to the runtime session key,
     // which may be a virtual negative id for a draft-originated tab (issue: the
@@ -3938,6 +3962,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     }
     viewerDetailSyncCancels.set(conversationId, cancel)
 
+    let loadWaitedMs = 0
     const attempt = (n: number): void => {
       if (cancelled) return
       const cur = get().byConversationId.get(conversationId)
@@ -3946,6 +3971,25 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // pure viewer this poll may refetch under.
       if (!cur || !isPureViewerSession(cur)) {
         cancel()
+        return
+      }
+      // A detail load the view started (its first fetch, a reload) is in
+      // flight. Reading now would bump the fetch generation and drop that
+      // load's result as stale, and only that result clears `detailLoading`:
+      // a poll that then failed or stopped left the view loading for good. The
+      // load is a fresh read in its own right, so wait for it to land and poll
+      // on from there, without spending an attempt. Past the cap, give up
+      // rather than tick forever behind a load that never settles.
+      if (cur.detailLoading) {
+        if (loadWaitedMs >= VIEWER_DETAIL_SYNC_LOAD_WAIT_CAP_MS) {
+          cancel()
+          return
+        }
+        loadWaitedMs += VIEWER_DETAIL_SYNC_LOAD_WAIT_STEP_MS
+        timer = setTimeout(
+          () => attempt(n),
+          VIEWER_DETAIL_SYNC_LOAD_WAIT_STEP_MS
+        )
         return
       }
       // Read the DB fetch id fresh each tick: a just-bound draft resolves its
