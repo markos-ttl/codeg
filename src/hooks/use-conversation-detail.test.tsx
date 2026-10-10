@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react"
+import { act, cleanup, renderHook } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import type { DbConversationDetail } from "@/lib/types"
@@ -132,6 +132,10 @@ describe("useConversationDetail streaming decoupling", () => {
 // its fetch, and fire it on the render that flips it visible.
 describe("useConversationDetail visibility gating", () => {
   afterEach(() => {
+    // Unmount BEFORE the reset: a still-mounted enabled hook answers the reset
+    // by fetching again, and that in-flight session would leak into the next
+    // test (RTL's own cleanup runs after this hook).
+    cleanup()
     act(() => resetConversationRuntimeStore())
     mockGet.mockReset()
   })
@@ -164,5 +168,63 @@ describe("useConversationDetail visibility gating", () => {
 
     expect(mockGet).toHaveBeenCalledTimes(1)
     expect(mockGet).toHaveBeenCalledWith(CID, { tailTurns: TAIL_TURNS_DEFAULT })
+  })
+
+  // A hidden tab is not session-less: the panel's mount effects (the runtime
+  // claim + `setPendingCleanup`) materialize its runtime session while the
+  // fetch waits. The render that shows it therefore reads a session with no
+  // detail and nothing in flight — and that is the render the panel's
+  // auto-connect gate is taken from. Reporting it as settled let the connect
+  // out with `sessionId: undefined`; it has to read as loading already.
+  it("reports loading on the very render that first shows the view", () => {
+    mockGet.mockReturnValue(new Promise<DbConversationDetail>(() => {}))
+    act(() => {
+      useConversationRuntimeStore
+        .getState()
+        .actions.setPendingCleanup(CID, false)
+    })
+    const seen: Array<{ visible: boolean; loading: boolean; detail: boolean }> =
+      []
+    const { rerender } = renderHook(
+      ({ visible }: { visible: boolean }) => {
+        const view = useConversationDetail(CID, { enabled: visible })
+        seen.push({
+          visible,
+          loading: view.loading,
+          detail: view.detail != null,
+        })
+        return view
+      },
+      { initialProps: { visible: false } }
+    )
+    expect(mockGet).not.toHaveBeenCalled()
+
+    act(() => {
+      rerender({ visible: true })
+    })
+
+    const shown = seen.filter((render) => render.visible)
+    expect(shown.length).toBeGreaterThan(0)
+    expect(shown).toEqual(
+      shown.map(() => ({ visible: true, loading: true, detail: false }))
+    )
+    expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  // The pending-fetch half of `loading` must follow `fetchDetail`'s own skip
+  // rule exactly: a session an ongoing turn holds is never fetched, so
+  // reporting it as loading would hold the panel's connect gate shut forever.
+  it("does not report a fetch it will not make as loading", () => {
+    act(() => {
+      useConversationRuntimeStore
+        .getState()
+        .actions.setLiveMessage(CID, liveMsg("m1"), true)
+    })
+
+    const { result } = renderHook(() => useConversationDetail(CID))
+
+    expect(result.current.loading).toBe(false)
+    expect(result.current.detail).toBeNull()
+    expect(mockGet).not.toHaveBeenCalled()
   })
 })

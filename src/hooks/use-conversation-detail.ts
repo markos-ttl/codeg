@@ -3,6 +3,7 @@
 import { useEffect } from "react"
 import { useShallow } from "zustand/react/shallow"
 import {
+  sessionHoldsActiveTurns,
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -36,6 +37,18 @@ export function useConversationDetail(
   }
 ): {
   detail: DbConversationDetail | null
+  /**
+   * True while the detail is being fetched — and ALSO on the render that is
+   * about to start that fetch. The fetch is dispatched from an effect, i.e.
+   * only after the render that decided it has committed, so without the second
+   * half that render reads as "settled, nothing persisted": no detail, not
+   * loading. A view kept mounted while hidden already has a runtime session
+   * (its mount effects create one), so the render that first shows it is
+   * exactly such a render — and the conversation panel's auto-connect gate,
+   * which waits on `loading` for the stored session id, would let the connect
+   * through with `sessionId: undefined` (backend `session/new`, history
+   * orphaned on the next prompt).
+   */
   loading: boolean
   error: string | null
   acpLoadError: string | null
@@ -49,32 +62,46 @@ export function useConversationDetail(
   // mid-stream, so `useShallow` keeps the slice reference-stable across batches
   // and consumers re-render only on a real detail transition. (`hasSession`
   // preserves the "session exists yet?" signal the loading state depends on.)
-  const { detail, detailLoading, detailError, acpLoadError, hasSession } =
-    useConversationRuntimeStore(
-      useShallow((s) => {
-        const session = s.byConversationId.get(conversationId)
-        return {
-          detail: session?.detail ?? null,
-          detailLoading: session?.detailLoading ?? false,
-          detailError: session?.detailError ?? null,
-          acpLoadError: session?.acpLoadError ?? null,
-          hasSession: session != null,
-        }
-      })
-    )
+  const {
+    detail,
+    detailLoading,
+    detailError,
+    acpLoadError,
+    hasSession,
+    needsFetch,
+  } = useConversationRuntimeStore(
+    useShallow((s) => {
+      const session = s.byConversationId.get(conversationId)
+      return {
+        detail: session?.detail ?? null,
+        detailLoading: session?.detailLoading ?? false,
+        detailError: session?.detailError ?? null,
+        acpLoadError: session?.acpLoadError ?? null,
+        hasSession: session != null,
+        // `fetchDetail`'s own admission rule, folded to one boolean: nothing
+        // loaded, nothing in flight, no ongoing turn holding the session. A
+        // streaming batch can't flip it — once a stream is under way (or a
+        // detail exists) it is already false — so the slice stays stable.
+        needsFetch:
+          session == null ||
+          (session.detail == null &&
+            !session.detailLoading &&
+            !sessionHoldsActiveTurns(session)),
+      }
+    })
+  )
   const { fetchDetail } = useConversationRuntimeActions()
   const isVirtual = isVirtualConversationId(conversationId)
+  const fetchPending = enabled && !isVirtual && needsFetch
 
   useEffect(() => {
-    if (!enabled) return
-    if (isVirtual) return
-    if (detail || detailLoading) return
+    if (!fetchPending) return
     fetchDetail(conversationId)
-  }, [enabled, conversationId, isVirtual, detail, detailLoading, fetchDetail])
+  }, [fetchPending, conversationId, fetchDetail])
 
   return {
     detail,
-    loading: hasSession ? detailLoading : !isVirtual,
+    loading: hasSession ? detailLoading || fetchPending : !isVirtual,
     error: detailError,
     acpLoadError,
   }

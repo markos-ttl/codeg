@@ -196,8 +196,8 @@ interface ConversationTabViewProps {
    *  calls — each one a tail window of up to `TAIL_TURNS_DEFAULT` (120) turns,
    *  so tens of MB across a large tab set — before the user had looked at a
    *  single one of them. A hidden tab now fetches on the first frame it
-   *  becomes visible, so the workspace opens with one conversation in flight
-   *  instead of N. */
+   *  becomes visible, so the workspace opens fetching only the tabs on screen
+   *  (one per split group, or every member of a tiled one) instead of all N. */
   isVisible: boolean
 }
 
@@ -510,7 +510,10 @@ const ConversationTabView = memo(function ConversationTabView({
   // tens-of-MB first paint described on `isVisible`. A hidden tab's effect
   // re-runs when `isVisible` flips true (tab switch, group selection, tiling),
   // which is also the moment its detail is first needed; until then the panel
-  // renders its loading state behind `invisible`, costing nothing.
+  // renders an empty transcript behind `invisible`, costing nothing. The
+  // render that first shows it already reports `detailLoading` (the hook
+  // counts a fetch it is about to start as loading) — that is what keeps
+  // `awaitingHistoricalSessionId` below closed on that render.
   const {
     detail,
     loading: detailLoading,
@@ -576,6 +579,12 @@ const ConversationTabView = memo(function ConversationTabView({
   // the backend falls back to session/new, orphaning the historical
   // context. cline doesn't support session resume, so it connects
   // immediately regardless.
+  //
+  // `detailLoading` must already be true on the render a tab turns active,
+  // since the auto-connect effect reads this gate from that very render: a
+  // restored tab that was hidden has a runtime session but no detail, and its
+  // fetch starts only in that render's effects. `useConversationDetail`
+  // reports the fetch it is about to start as loading for exactly this.
   const awaitingHistoricalSessionId =
     hasPersistedConversation && selectedAgent !== "cline" && detailLoading
   // Install status of the currently selected agent. An agent can be enabled and

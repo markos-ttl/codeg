@@ -2993,6 +2993,23 @@ function isPureViewerSession(session: ConversationRuntimeSession): boolean {
 }
 
 /**
+ * Whether a session already holds turns of an ongoing conversation (an
+ * optimistic prompt, a live stream, or promoted local turns). `fetchDetail`
+ * skips such a session, and `useConversationDetail` asks the same question to
+ * tell whether its auto-fetch is about to run — one predicate, so the hook can
+ * never report a fetch as pending that `fetchDetail` would then decline.
+ */
+export function sessionHoldsActiveTurns(
+  session: ConversationRuntimeSession
+): boolean {
+  return (
+    session.optimisticTurns.length > 0 ||
+    session.liveMessage !== null ||
+    session.localTurns.length > 0
+  )
+}
+
+/**
  * Build the render timeline for a conversation from its runtime session,
  * memoized per session object via `timelineCache`. Verbatim port of the former
  * `getTimelineTurns` context callback; reads `state` explicitly so it can be
@@ -3743,14 +3760,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (session?.detail || session?.detailLoading) return
 
     // Skip fetch if session has active data (ongoing conversation)
-    if (
-      session &&
-      (session.optimisticTurns.length > 0 ||
-        session.liveMessage !== null ||
-        session.localTurns.length > 0)
-    ) {
-      return
-    }
+    if (session && sessionHoldsActiveTurns(session)) return
 
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
