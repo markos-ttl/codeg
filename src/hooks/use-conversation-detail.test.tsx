@@ -269,7 +269,7 @@ describe("useConversationDetail after a failed fetch", () => {
     expect(result.current.loading).toBe(false)
   })
 
-  it("retries on a growing delay, then stops", async () => {
+  it("retries on a growing delay, then keeps retrying at the last one", async () => {
     vi.useFakeTimers()
     failEveryFetch("server down")
 
@@ -277,7 +277,9 @@ describe("useConversationDetail after a failed fetch", () => {
     await act(async () => {})
     expect(mockGet).toHaveBeenCalledTimes(1)
 
-    for (const [step, delay] of DETAIL_RETRY_DELAYS_MS.entries()) {
+    const last = DETAIL_RETRY_DELAYS_MS[DETAIL_RETRY_DELAYS_MS.length - 1]
+    const schedule = [...DETAIL_RETRY_DELAYS_MS, last, last]
+    for (const [step, delay] of schedule.entries()) {
       await act(async () => {
         vi.advanceTimersByTime(delay - 1)
       })
@@ -287,11 +289,39 @@ describe("useConversationDetail after a failed fetch", () => {
       })
       expect(mockGet).toHaveBeenCalledTimes(step + 2)
     }
+  })
+
+  it("starts the schedule over once a detail has loaded", async () => {
+    vi.useFakeTimers()
+    mockGet
+      .mockRejectedValueOnce(new Error("blip"))
+      .mockRejectedValueOnce(new Error("blip"))
+      .mockResolvedValueOnce(makeDetail())
+      .mockRejectedValueOnce(new Error("blip again"))
+      .mockReturnValue(new Promise<DbConversationDetail>(() => {}))
+
+    renderHook(() => useConversationDetail(CID))
+    await act(async () => {})
+    await act(async () => {
+      vi.advanceTimersByTime(DETAIL_RETRY_DELAYS_MS[0])
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(DETAIL_RETRY_DELAYS_MS[1])
+    })
+    expect(mockGet).toHaveBeenCalledTimes(3)
+
+    // The session goes away under the mounted view (released and recreated),
+    // so the view fetches afresh — and that fetch fails again.
+    act(() => {
+      useConversationRuntimeStore.getState().actions.removeConversation(CID)
+    })
+    await act(async () => {})
+    expect(mockGet).toHaveBeenCalledTimes(4)
 
     await act(async () => {
-      vi.advanceTimersByTime(10 * 60_000)
+      vi.advanceTimersByTime(DETAIL_RETRY_DELAYS_MS[0])
     })
-    expect(mockGet).toHaveBeenCalledTimes(DETAIL_RETRY_DELAYS_MS.length + 1)
+    expect(mockGet).toHaveBeenCalledTimes(5)
   })
 
   it("lands the detail when a retry succeeds", async () => {

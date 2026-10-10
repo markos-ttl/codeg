@@ -14,17 +14,19 @@ function isVirtualConversationId(conversationId: number): boolean {
 }
 
 /**
- * Delays before each automatic retry of a failed detail fetch. A failure
- * leaves no detail and nothing in flight, which is exactly what the auto-fetch
- * keys on, so it used to re-request on the very next render, as fast as the
- * transport could fail: a transcript that will not parse was re-parsed in a
- * hot loop, a server that was down was hammered until it came back, and the
- * error flickered in and out the whole time. A few spaced retries still ride
- * out a blip or a restart; after the last one the error stays on screen next
- * to its Reload action.
+ * Delays before each automatic retry of a failed detail fetch; the last one
+ * repeats for as long as the failure lasts. A failure leaves no detail and
+ * nothing in flight, which is exactly what the auto-fetch keys on, so it used
+ * to re-request on the very next render, as fast as the transport could fail:
+ * a transcript that will not parse was re-parsed in a hot loop, a server that
+ * was down was hammered until it came back, and the error flickered in and out
+ * the whole time. Spaced retries keep what that loop did right — a view picks
+ * its conversation back up once the server is reachable again, here within
+ * half a minute — and the error stays readable, next to its Reload action, in
+ * between.
  */
 export const DETAIL_RETRY_DELAYS_MS: readonly number[] = [
-  1_000, 2_000, 4_000, 8_000, 16_000,
+  1_000, 2_000, 4_000, 8_000, 16_000, 30_000,
 ]
 
 export function useConversationDetail(
@@ -132,11 +134,12 @@ export function useConversationDetail(
   useEffect(() => {
     if (!retryPending) return
     const used = retriesUsedRef.current
-    if (used >= DETAIL_RETRY_DELAYS_MS.length) return
+    const delay =
+      DETAIL_RETRY_DELAYS_MS[Math.min(used, DETAIL_RETRY_DELAYS_MS.length - 1)]
     const timer = setTimeout(() => {
       retriesUsedRef.current = used + 1
       fetchDetail(conversationId)
-    }, DETAIL_RETRY_DELAYS_MS[used])
+    }, delay)
     return () => clearTimeout(timer)
   }, [retryPending, conversationId, fetchDetail])
 
