@@ -2381,9 +2381,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       // backend accepts instead of the legacy full detail. Without a window the
       // response carries every turn of the child session — for a long child
       // that is megabytes of transcript transferred and re-parsed purely to
-      // read `detail.summary`. `tailTurns: 1` still returns the summary and
-      // round-aligns to the last user round, which is what the tab label and
-      // status need.
+      // read `detail.summary`. `tailTurns: 1` is the smallest window the
+      // backend accepts (it still widens back to the last user turn). The
+      // summary describes the whole transcript whatever the window, and it is
+      // all the tab label and status read.
       void getFolderConversation(id, { tailTurns: 1 })
         .then((detail) => {
           if (seedEpoch !== epoch) return
