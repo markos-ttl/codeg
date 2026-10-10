@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect } from "react"
+import { useEffect, useRef } from "react"
 import { useShallow } from "zustand/react/shallow"
 import {
   sessionHoldsActiveTurns,
@@ -12,6 +12,20 @@ import type { DbConversationDetail } from "@/lib/types"
 function isVirtualConversationId(conversationId: number): boolean {
   return !Number.isFinite(conversationId) || conversationId <= 0
 }
+
+/**
+ * Delays before each automatic retry of a failed detail fetch. A failure
+ * leaves no detail and nothing in flight, which is exactly what the auto-fetch
+ * keys on, so it used to re-request on the very next render, as fast as the
+ * transport could fail: a transcript that will not parse was re-parsed in a
+ * hot loop, a server that was down was hammered until it came back, and the
+ * error flickered in and out the whole time. A few spaced retries still ride
+ * out a blip or a restart; after the last one the error stays on screen next
+ * to its Reload action.
+ */
+export const DETAIL_RETRY_DELAYS_MS: readonly number[] = [
+  1_000, 2_000, 4_000, 8_000, 16_000,
+]
 
 export function useConversationDetail(
   conversationId: number,
@@ -69,35 +83,62 @@ export function useConversationDetail(
     acpLoadError,
     hasSession,
     needsFetch,
+    retryDue,
   } = useConversationRuntimeStore(
     useShallow((s) => {
       const session = s.byConversationId.get(conversationId)
+      // `fetchDetail`'s own admission rule: nothing loaded, nothing in flight,
+      // no ongoing turn holding the session. Exposed only as booleans: a
+      // streaming batch can't flip them — once a stream is under way (or a
+      // detail exists) they are already false — so the slice stays stable.
+      const admissible =
+        session == null ||
+        (session.detail == null &&
+          !session.detailLoading &&
+          !sessionHoldsActiveTurns(session))
       return {
         detail: session?.detail ?? null,
         detailLoading: session?.detailLoading ?? false,
         detailError: session?.detailError ?? null,
         acpLoadError: session?.acpLoadError ?? null,
         hasSession: session != null,
-        // `fetchDetail`'s own admission rule, folded to one boolean: nothing
-        // loaded, nothing in flight, no ongoing turn holding the session. A
-        // streaming batch can't flip it — once a stream is under way (or a
-        // detail exists) it is already false — so the slice stays stable.
-        needsFetch:
-          session == null ||
-          (session.detail == null &&
-            !session.detailLoading &&
-            !sessionHoldsActiveTurns(session)),
+        // Fetch right away — unless the last fetch failed, which waits for
+        // the retry schedule instead.
+        needsFetch: admissible && session?.detailError == null,
+        retryDue: admissible && session?.detailError != null,
       }
     })
   )
   const { fetchDetail } = useConversationRuntimeActions()
   const isVirtual = isVirtualConversationId(conversationId)
   const fetchPending = enabled && !isVirtual && needsFetch
+  const retryPending = enabled && !isVirtual && retryDue
 
   useEffect(() => {
     if (!fetchPending) return
     fetchDetail(conversationId)
   }, [fetchPending, conversationId, fetchDetail])
+
+  // Automatic retries spent on the current run of failures. A loaded detail or
+  // another conversation starts a new run. A hidden view's pending retry is
+  // dropped and rescheduled, at the same step, when the view is shown again.
+  const retriesUsedRef = useRef(0)
+  useEffect(() => {
+    retriesUsedRef.current = 0
+  }, [conversationId])
+  useEffect(() => {
+    if (detail) retriesUsedRef.current = 0
+  }, [detail])
+  useEffect(() => {
+    if (!retryPending) return
+    const used = retriesUsedRef.current
+    if (used >= DETAIL_RETRY_DELAYS_MS.length) return
+    const timer = setTimeout(() => {
+      retriesUsedRef.current = used + 1
+      fetchDetail(conversationId)
+    }, DETAIL_RETRY_DELAYS_MS[used])
+    return () => clearTimeout(timer)
+  }, [retryPending, conversationId, fetchDetail])
 
   return {
     detail,

@@ -7,7 +7,10 @@ import {
   TAIL_TURNS_DEFAULT,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
-import { useConversationDetail } from "./use-conversation-detail"
+import {
+  DETAIL_RETRY_DELAYS_MS,
+  useConversationDetail,
+} from "./use-conversation-detail"
 
 // The runtime store calls the transport directly; the visibility-gating tests
 // below assert on the call itself, so the transport is stubbed out.
@@ -226,5 +229,116 @@ describe("useConversationDetail visibility gating", () => {
     expect(result.current.loading).toBe(false)
     expect(result.current.detail).toBeNull()
     expect(mockGet).not.toHaveBeenCalled()
+  })
+})
+
+// A failed fetch leaves no detail and nothing in flight — exactly what the
+// auto-fetch keys on — so it used to be re-requested on the very next render,
+// as fast as the transport could fail, with the error flickering in and out.
+describe("useConversationDetail after a failed fetch", () => {
+  // Rejects every call up to a cap, then never settles: a regression back to
+  // the hot loop then fails the call-count assertions instead of spinning the
+  // worker out of memory.
+  function failEveryFetch(message: string) {
+    let calls = 0
+    mockGet.mockImplementation(() => {
+      calls += 1
+      return calls <= 50
+        ? Promise.reject(new Error(message))
+        : new Promise<DbConversationDetail>(() => {})
+    })
+  }
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    act(() => resetConversationRuntimeStore())
+    mockGet.mockReset()
+  })
+
+  it("leaves the failure on screen instead of re-requesting it at once", async () => {
+    failEveryFetch("unreadable transcript")
+
+    const { result } = renderHook(() => useConversationDetail(CID))
+    for (let round = 0; round < 5; round++) {
+      await act(async () => {})
+    }
+
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(result.current.error).toBe("unreadable transcript")
+    expect(result.current.loading).toBe(false)
+  })
+
+  it("retries on a growing delay, then stops", async () => {
+    vi.useFakeTimers()
+    failEveryFetch("server down")
+
+    renderHook(() => useConversationDetail(CID))
+    await act(async () => {})
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    for (const [step, delay] of DETAIL_RETRY_DELAYS_MS.entries()) {
+      await act(async () => {
+        vi.advanceTimersByTime(delay - 1)
+      })
+      expect(mockGet).toHaveBeenCalledTimes(step + 1)
+      await act(async () => {
+        vi.advanceTimersByTime(1)
+      })
+      expect(mockGet).toHaveBeenCalledTimes(step + 2)
+    }
+
+    await act(async () => {
+      vi.advanceTimersByTime(10 * 60_000)
+    })
+    expect(mockGet).toHaveBeenCalledTimes(DETAIL_RETRY_DELAYS_MS.length + 1)
+  })
+
+  it("lands the detail when a retry succeeds", async () => {
+    vi.useFakeTimers()
+    const detail = makeDetail()
+    mockGet
+      .mockRejectedValueOnce(new Error("blip"))
+      .mockResolvedValueOnce(detail)
+
+    const { result } = renderHook(() => useConversationDetail(CID))
+    await act(async () => {})
+    expect(result.current.error).toBe("blip")
+
+    await act(async () => {
+      vi.advanceTimersByTime(DETAIL_RETRY_DELAYS_MS[0])
+    })
+
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(result.current.detail).toBe(detail)
+    expect(result.current.error).toBeNull()
+    expect(result.current.loading).toBe(false)
+  })
+
+  it("holds a pending retry while the view is hidden", async () => {
+    vi.useFakeTimers()
+    failEveryFetch("server down")
+
+    const { rerender } = renderHook(
+      ({ visible }: { visible: boolean }) =>
+        useConversationDetail(CID, { enabled: visible }),
+      { initialProps: { visible: true } }
+    )
+    await act(async () => {})
+    act(() => {
+      rerender({ visible: false })
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(60_000)
+    })
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      rerender({ visible: true })
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(DETAIL_RETRY_DELAYS_MS[0])
+    })
+    expect(mockGet).toHaveBeenCalledTimes(2)
   })
 })
