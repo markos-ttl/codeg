@@ -2070,7 +2070,8 @@
         "assistant": "المساعد",
         "system": "النظام",
         "toolResult": "النتيجة",
-        "toolError": "خطأ"
+        "toolError": "خطأ",
+        "turnFailed": "فشلت الجولة"
       },
       "moreActions": "إجراءات إضافية"
     },
@@ -3439,6 +3440,7 @@
         "errorActionCommandCopied": "تم النسخ",
         "emptyConversation": "لا توجد رسائل في هذه المحادثة.",
         "systemMessage": "رسالة النظام",
+        "turnFailed": "فشلت هذه الجولة: {message}",
         "copyMessage": "نسخ",
         "forkFromHere": "تفريع من هنا",
         "forkBusy": "لا يمكن التفريع أثناء تنفيذ دور",

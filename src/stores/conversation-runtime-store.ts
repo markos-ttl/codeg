@@ -630,7 +630,7 @@ interface BuiltStreamingTurns {
 /** One turn under construction inside a live message. Assistant groups are the
  *  reply's rounds; a `user` group is a message the user sent mid-turn. */
 interface StreamingGroup {
-  role: "assistant" | "user"
+  role: "assistant" | "user" | "system"
   blocks: MessageTurn["blocks"]
   /**
    * Overrides the live message's start for this group. Only a `user` group sets
@@ -1282,6 +1282,19 @@ export function buildStreamingTurnsFromLiveMessage(
       continue
     }
 
+    // A failed turn's account closes the reply the same way, as a `system`
+    // turn of its own holding the `turn_error` block — what a reload draws
+    // from the agent's record of the failure.
+    if (block.type === "turn_error") {
+      groups.push({
+        role: "system",
+        blocks: [{ type: "turn_error", message: block.message }],
+      })
+      groups.push({ role: "assistant", blocks: [] })
+      currentGroupHasCompletedTool = false
+      continue
+    }
+
     const isContentBlock =
       block.type === "text" ||
       block.type === "thinking" ||
@@ -1553,6 +1566,43 @@ export interface TurnMetadataPatch {
   source_turn_id?: string | null
 }
 
+/** A failed round's closing line: a `system` turn of `turn_error` blocks. */
+function isTurnErrorTurn(turn: MessageTurn): boolean {
+  return (
+    turn.role === "system" &&
+    turn.blocks.length > 0 &&
+    turn.blocks.every((block) => block.type === "turn_error")
+  )
+}
+
+/**
+ * Whether the parse holds the round that just ended — `parseEndsWithAssistant`
+ * below. It does when its last turn is the reply. Agents write the prompt
+ * before anything else of a round, so a trailing USER turn still means the
+ * transcript is behind.
+ *
+ * It also does when it ends on a FAILED round's line (written as that round's
+ * last record) — but only if the round that just ended here failed too.
+ * Otherwise the line is an EARLIER round's: the transcript has not reached
+ * this client's newest round at all, and a parser split of the failed reply
+ * could cancel the deficit `offset` would show, naming the newest reply after
+ * the failed one.
+ */
+export function parseHoldsTheLatestRound(
+  parsedTurns: MessageTurn[],
+  localTurns: MessageTurn[]
+): boolean {
+  const last = parsedTurns[parsedTurns.length - 1]
+  if (!last) return false
+  if (last.role === "assistant") return true
+  const newestLocal = localTurns[localTurns.length - 1]
+  return (
+    isTurnErrorTurn(last) &&
+    newestLocal !== undefined &&
+    isTurnErrorTurn(newestLocal)
+  )
+}
+
 /**
  * Align a fresh parse's assistant turns onto this session's completed local
  * assistant turns and emit the metadata (usage / duration / model /
@@ -1592,10 +1642,11 @@ export function computeTurnMetadataPatches(params: {
   persistedAssistantCount: number
   /**
    * Whether the LAST turn of the parse (any role) is an assistant turn — i.e.
-   * the reply that just completed has reached disk. Agents append the user
-   * prompt before the reply, so a trailing USER turn is the transcript telling
-   * us it is still behind. Only `source_turn_id` consults this; the stats keep
-   * their existing best-effort alignment.
+   * the reply that just completed has reached disk — or the line closing the
+   * failed round that just ended (see `parseHoldsTheLatestRound`). Agents
+   * append the user prompt before the reply, so a trailing USER turn is the
+   * transcript telling us it is still behind. Only `source_turn_id` consults
+   * this; the stats keep their existing best-effort alignment.
    */
   parseEndsWithAssistant: boolean
 }): TurnMetadataPatch[] {
@@ -4104,9 +4155,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                     localAssistantIndices,
                     parsedAssistantTurns,
                     persistedAssistantCount,
-                    parseEndsWithAssistant:
-                      parsed.turns[parsed.turns.length - 1]?.role ===
-                      "assistant",
+                    parseEndsWithAssistant: parseHoldsTheLatestRound(
+                      parsed.turns,
+                      cur.localTurns
+                    ),
                   })
             // An unverified window is worth another look ONLY when the
             // transcript is behind: `fromIndex` clamps to the total, so an

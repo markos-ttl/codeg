@@ -2070,7 +2070,8 @@
         "assistant": "어시스턴트",
         "system": "시스템",
         "toolResult": "결과",
-        "toolError": "오류"
+        "toolError": "오류",
+        "turnFailed": "턴 실패"
       },
       "moreActions": "추가 작업"
     },
@@ -3439,6 +3440,7 @@
         "errorActionCommandCopied": "복사됨",
         "emptyConversation": "이 대화에는 메시지가 없습니다.",
         "systemMessage": "시스템 메시지",
+        "turnFailed": "이번 턴 실패: {message}",
         "copyMessage": "복사",
         "forkFromHere": "여기서 분기",
         "forkBusy": "턴이 실행 중일 때는 분기할 수 없습니다",

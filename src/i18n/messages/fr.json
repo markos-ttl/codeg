@@ -2070,7 +2070,8 @@
         "assistant": "Assistant",
         "system": "Système",
         "toolResult": "Résultat",
-        "toolError": "Erreur"
+        "toolError": "Erreur",
+        "turnFailed": "Échec du tour"
       },
       "moreActions": "Plus d’actions"
     },
@@ -3439,6 +3440,7 @@
         "errorActionCommandCopied": "Copié",
         "emptyConversation": "Aucun message dans cette conversation.",
         "systemMessage": "Message système",
+        "turnFailed": "Échec du tour : {message}",
         "copyMessage": "Copier",
         "forkFromHere": "Bifurquer d'ici",
         "forkBusy": "Impossible de bifurquer pendant qu'un tour est en cours",

@@ -1936,9 +1936,72 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             //   * 2.1.292 honours `NO_PROXY` for the CLI's own sign-in and
             //     policy requests, so the bypass list codeg exports with its
             //     proxy setting now reaches them too.
+            //
+            // 0.89.0 changes the adapter only: the Claude SDK stays 0.3.293
+            // (CLI 2.1.293), the ACP SDK moves 1.7.0 → 1.8.0 and
+            // `engines.node` stays ">=22". Each tag's own scenario harness, run
+            // with codeg's exact `clientCapabilities`, is byte-identical in all
+            // 40 scenarios apart from `initialize`, whose AIR capability list
+            // gains "customInstructions" (codeg reads nothing off that list).
+            // A live conversation against the local fake Anthropic API (a new
+            // session, a Bash turn, then resume and load in fresh processes)
+            // matches 0.88.0's frame for frame apart from timing.
+            //
+            // (kkk) **Archived titles** (#1268). JetBrains AIR archives a
+            // session by appending its title again as `[archived] <title>` (a
+            // `custom-title` and an `agent-name` record). The adapter now
+            // publishes such a title to an AIR client, which codeg is, without
+            // the marker, while the transcript keeps it: measured live, 0.88.0
+            // publishes "[archived] Probe title" and 0.89.0 "Probe title" (the
+            // prefixed one still to a client that is not AIR). codeg's two
+            // title producers, the wire and the transcript, would then disagree
+            // and the sidebar row flip between them, so both read a title
+            // through `parsers::claude::displayed_session_title`, which drops
+            // the marker by AIR's rule.
+            //
+            // (lll) The session index (`sessionIndex`, #1268: an indexed
+            // `session/list`, `_session/rename` / `archive` / `unarchive` and a
+            // pushed `_session/list/subscribe`) is not adopted. It lives inside
+            // a running adapter, while codeg's list is read offline from the
+            // transcripts, for every agent, and must work with none running.
+            // Undeclared it is inert: a live trace shows the same one settings
+            // watcher as 0.88.0, no timer and no extra scan of the projects
+            // directory, about 0.6 MB more heap, and the new methods answer
+            // -32601. Without it an AIR client's `session/delete` ARCHIVES
+            // (appends the title records above and keeps the transcript) and
+            // `session/list` hides archived sessions; codeg sends neither.
+            //
+            // (mmm) Custom instructions (#1177: `_meta.jetbrains.air.
+            // customInstructions` on `session/new`, appended to the
+            // `claude_code` preset, honoured from any client) are not adopted:
+            // no codeg surface supplies session-level instructions. Measured
+            // live, CLI 2.1.293 freezes a session's system prompt at its first
+            // model request (a `prompt_snapshot` attachment replayed on every
+            // resume, load and fork, and across a `/compact`), so instructions
+            // sent later never apply; 0.88.0's CLI does the same.
+            // `_meta.systemPrompt` replaces them outright and is the knob to
+            // reach for if a feature ever needs one: it also works on 0.88.0
+            // and takes `snapshot: false`.
+            //
+            // (nnn) The ACP SDK 1.8.0 checks `session/new` / `load` / `resume`
+            // strictly: a malformed `mcpServers` entry (a stdio server without
+            // `args` or `env`, an http one without `headers`, `env` as an
+            // object) or a non-string `additionalDirectories` item now fails the
+            // request with -32602 where 0.88.0 dropped it. codeg builds its
+            // entries through the Rust crate's typed constructors, which always
+            // write those fields, and they pass on both versions.
+            //
+            // (ooo) Nothing else reaches codeg. `session/close` of a session
+            // that is not loaded answers `{}` instead of -32603
+            // (`close_forked_parent` only logs either way). The message drain
+            // yields to the event loop every 8 ms: timing only, and a
+            // 30,000-delta flood with a cancel measured no difference. #1278
+            // recreates live sessions on the ACP `logout`, which codeg never
+            // sends to Claude, and #1288–#1290 change the experimental ACP v2
+            // surface only.
             distribution: AgentDistribution::Npx {
-                version: "0.88.0",
-                package: "@agentclientprotocol/claude-agent-acp@0.88.0",
+                version: "0.89.0",
+                package: "@agentclientprotocol/claude-agent-acp@0.89.0",
                 cmd: "claude-agent-acp",
                 args: &[],
                 env: &[],
@@ -2823,13 +2886,128 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // splits the current one and leaves the early one whole. Across a
             // local corpus of 4,137 rollouts, the one message that decodes is
             // the one desktop envelope in it.
+            //
+            // 2.2.1 follows 2.2.0, which was tagged but never published to
+            // npm. `@openai/codex` moves ^0.159.1 → **^0.160.1** (a fresh
+            // install resolves 0.160.1), whose `debug models --bundled` output
+            // is byte-identical to 0.159.3's, so the offline snapshot stands;
+            // `engines` is still absent. Under codeg's exact
+            // `clientCapabilities` the adapter's 33-scenario harness differs
+            // between the tags only by two AIR capabilities in `initialize`
+            // ("customInstructions", "codexHooks") and the `/mcp` entry of (ee).
+            // A live plain turn and shell turn add to those only the `$skill`
+            // paths of (ee) and the prompt response's `usage` of (ff).
+            //
+            // (bb) **Node 20.3.0 floor.** 2.2.1 calls `AbortSignal.any` on every
+            // `session/prompt`, and Node has it from 20.3.0: live on Node
+            // 20.2.0 every prompt fails with -32603 "AbortSignal.any is not a
+            // function", while 2.1.1 runs there. `node_required` is 20.3.0, and
+            // the diagnostics page now compares the whole version, as the
+            // launch preflight always did.
+            //
+            // (cc) **The app-server is supervised for every client** (#590,
+            // #604). Up to 2.1.1 a dead `codex app-server` left the adapter up
+            // but useless: a turn in flight never answered (a cancel did not
+            // help), an open permission card was never withdrawn, every later
+            // prompt ended in an internal-error failure and every open failed
+            // with "Connection is disposed." until codeg respawned the adapter.
+            // Now a turn in flight settles at once, `end_turn` with a
+            // `connection` `sessionFailure`, its open tool calls failed and its
+            // permission requests withdrawn by `$/cancel_request` (all of which
+            // codeg already renders), and the next request restarts the
+            // app-server and reopens the session. A request that meets the loss
+            // fails with code 1001 and `data.restartable`
+            // (`connection::codex_app_server_lost`). A restartable loss costs
+            // that request only. An unrestartable one (a session that never
+            // reached disk, #604; the crash-loop guard after 5 crashes in 5
+            // min; a thread whose open crashed the app-server twice) ends the
+            // connection, since every later prompt would fail the same way. On
+            // an open, either kind now raises the `session_unavailable` banner
+            // instead of the `session/new` fallback, which 2.2 lets succeed on
+            // the restarted app-server and which would orphan the history. All
+            // measured live by SIGKILLing the app-server, bar the refused
+            // thread, which is read from the source.
+            //
+            // (dd) A fork stays subscribed (#590), so it takes a prompt at once.
+            // codeg's resume after the fork is redundant on 2.2 but harmless
+            // (measured: fork → resume → close the parent → prompt works on
+            // both tags) and stays for older adapters. The fork still never
+            // releases the parent, so `close_forked_parent` stays as well.
+            //
+            // (ee) `/mcp` (#579) reports each server's live status in markdown
+            // and takes `reconnect`, which its entry now names as the input
+            // hint `[reconnect]`. Every status read briefly starts one more copy
+            // of each session MCP server, codeg-mcp included, which is harmless:
+            // codeg-mcp opens its socket on `tools/call` only. `$skill` commands
+            // carry their SKILL.md path in `_meta.jetbrains.air.skillPath`,
+            // which codeg does not show.
+            //
+            // (ff) Inert for codeg. #587 reports the servers config.toml
+            // replaces only when `DISABLE_MCP_CONFIG_FILTERING` is not "true",
+            // and `apply_codex_env_policy` sets it. That has to stay: codeg
+            // forwards config.toml's servers under their own names, and each
+            // would otherwise come back as a failed `mcp__<name>__startup` card.
+            // #588's hook trust needs `CODEX_CONFIG.hooks` (and cross-spawn a
+            // Windows `CODEX_PATH`), neither of which codeg sets. #546's custom
+            // instructions are read from `session/new`'s `_meta` only (they
+            // become the thread's developer instructions and persist in the
+            // rollout), which codeg does not send. #594 changes `authenticate`,
+            // which codeg never calls for codex. The session index (#590) needs
+            // the `sessionIndex` capability, as on claude (lll). The prompt
+            // response's `usage` now sums the whole prompt and reports
+            // `cachedWriteTokens`; codeg reads neither, and the context ring
+            // follows `usage_update`, which is unchanged.
+            //
+            // (gg) codex 0.160 itself. The rollout gains one record, a
+            // developer-role `<content_filter_guidance>` message after a
+            // response a content filter blocked, which `parsers::codex` skips
+            // like every developer message; the app-server protocol and the
+            // persisted formats are otherwise unchanged. The catalog's new
+            // `model_messages.content_filter_guidance` is strict
+            // (`codex_model_catalog::model_messages_override_is_safe`). A
+            // provider's `model_catalog_url` is now authoritative; codeg never
+            // writes one. Hooks behave as on 0.159: an untrusted hook in the
+            // user's config.toml is skipped silently.
+            //
+            // (hh) Found on the way, and older than this pin: codex counts a
+            // prompt-cache WRITE inside `input_tokens`
+            // (`cache_write_input_tokens`, which codeg's bound provider
+            // reports), and `parsers::codex` split out only the read, so every
+            // write read as fresh input. 2.2.0 corrected its own counter the
+            // same way (`TokenCount`); the parser now splits both
+            // (`codex_usage_counters`, token-usage `FACT_SCHEMA_VERSION` 4).
+            //
+            // 2.2.2 changes one thing (#606), and nothing codeg reads: a
+            // `session/list` row, and a pushed `_session/list/changes` row, is
+            // titled by the first non-blank of the thread's `name`, `title`,
+            // `summary` and `preview`, collapsed to one line and no longer cut
+            // to 256. codeg sends no `session/list` and subscribes to no list.
+            // The published bundle differs from 2.2.1's by that change and the
+            // version only. Fresh installs of the two pins lock the same
+            // package versions bar the adapter's own and the same codex 0.160.1
+            // binary, and `initialize` (bar the version) is identical. The
+            // `session_info_update` titles codeg does read are unchanged, still
+            // collapsed and cut at 256 — measured live on both tags: the
+            // first-prompt fallback, the generated title, a `/rename` echo and
+            // the title `session/load` republishes (`session/resume` publishes
+            // none).
+            //
+            // (ii) Found through #606, and older than this pin: codex stores a
+            // thread name only trimmed, so `/rename   Fix  the\nflaky\ttest`
+            // leaves `"Fix  the\nflaky\ttest"` in `session_index.jsonl` while
+            // the live title reads "Fix the flaky test", and `parsers::codex`
+            // read the raw name — the live path and every list or detail load
+            // kept rewriting the row with each other's spelling. A thread name
+            // now goes through the adapter's own title function
+            // (`codex_acp_session_title`, cut included) and then the live
+            // path's (`codex_thread_title`).
             distribution: AgentDistribution::Npx {
-                version: "2.1.1",
-                package: "@agentclientprotocol/codex-acp@2.1.1",
+                version: "2.2.2",
+                package: "@agentclientprotocol/codex-acp@2.2.2",
                 cmd: "codex-acp",
                 args: &[],
                 env: &[],
-                node_required: Some("20.0.0"),
+                node_required: Some("20.3.0"),
             },
         },
         AgentType::Gemini => AcpAgentMeta {
@@ -4273,8 +4451,8 @@ mod tests {
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
             AgentType::ClaudeCode,
-            "0.88.0",
-            "@agentclientprotocol/claude-agent-acp@0.88.0",
+            "0.89.0",
+            "@agentclientprotocol/claude-agent-acp@0.89.0",
             Some("22.0.0"),
         );
         assert_npx_version(
@@ -4315,9 +4493,9 @@ mod tests {
         );
         assert_npx_version(
             AgentType::Codex,
-            "2.1.1",
-            "@agentclientprotocol/codex-acp@2.1.1",
-            Some("20.0.0"),
+            "2.2.2",
+            "@agentclientprotocol/codex-acp@2.2.2",
+            Some("20.3.0"),
         );
         assert_npx_version(AgentType::Pi, "0.0.34", "pi-acp@0.0.34", Some("22.0.0"));
         assert_npx_version(

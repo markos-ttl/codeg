@@ -2070,7 +2070,8 @@
         "assistant": "Assistent",
         "system": "System",
         "toolResult": "Ergebnis",
-        "toolError": "Fehler"
+        "toolError": "Fehler",
+        "turnFailed": "Runde fehlgeschlagen"
       },
       "moreActions": "Weitere Aktionen"
     },
@@ -3439,6 +3440,7 @@
         "errorActionCommandCopied": "Kopiert",
         "emptyConversation": "Keine Nachrichten in dieser Unterhaltung.",
         "systemMessage": "Systemnachricht",
+        "turnFailed": "Runde fehlgeschlagen: {message}",
         "copyMessage": "Kopieren",
         "forkFromHere": "Ab hier verzweigen",
         "forkBusy": "Verzweigen nicht möglich, während ein Zug läuft",

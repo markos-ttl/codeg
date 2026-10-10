@@ -2070,7 +2070,8 @@
         "assistant": "Asistente",
         "system": "Sistema",
         "toolResult": "Resultado",
-        "toolError": "Error"
+        "toolError": "Error",
+        "turnFailed": "Turno fallido"
       },
       "moreActions": "Más acciones"
     },
@@ -3439,6 +3440,7 @@
         "errorActionCommandCopied": "Copiado",
         "emptyConversation": "No hay mensajes en esta conversación.",
         "systemMessage": "Mensaje del sistema",
+        "turnFailed": "El turno falló: {message}",
         "copyMessage": "Copiar",
         "forkFromHere": "Bifurcar desde aquí",
         "forkBusy": "No se puede bifurcar mientras hay un turno en curso",

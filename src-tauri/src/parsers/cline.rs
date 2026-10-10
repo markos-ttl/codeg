@@ -123,12 +123,38 @@ impl SessionMessage {
     /// assistant responses"), and a live ACP turn reports the failure as an
     /// error, never as a message. Rendering it would put the error in the
     /// model's mouth on every reopen, the same trap as the `<synthetic>` /
-    /// `isApiErrorMessage` records `parsers::claude` and `parsers::qoder` skip.
+    /// `isApiErrorMessage` records `parsers::claude` and `parsers::qoder` turn
+    /// into a failure line instead — which is what [`Self::display_error`]
+    /// feeds.
     fn is_display_only(&self) -> bool {
         self.metadata
             .get("displayOnly")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
+    }
+
+    /// The error a display-only `displayRole: "error"` message reports.
+    fn display_error(&self) -> Option<String> {
+        if self
+            .metadata
+            .get("displayRole")
+            .and_then(serde_json::Value::as_str)
+            != Some("error")
+        {
+            return None;
+        }
+        match &self.content {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Array(blocks) => Some(
+                blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -386,9 +412,6 @@ impl ClineParser {
         };
 
         for msg in &messages.messages {
-            if msg.is_display_only() {
-                continue;
-            }
             let timestamp = match msg.ts.filter(|ts| *ts > 0).map(ts_to_datetime) {
                 Some(ts) => {
                     last_ts = ts;
@@ -396,6 +419,34 @@ impl ClineParser {
                 }
                 None => last_ts,
             };
+            if msg.is_display_only() {
+                // A FAILED run closes its round on the error, as the failure
+                // line rather than as the model's reply.
+                if let Some(failure) = msg
+                    .display_error()
+                    .filter(|error| !error.trim().is_empty())
+                    .and_then(|error| {
+                        super::turn_error_message(
+                            next_turn_id(&mut turn_counter),
+                            &error,
+                            timestamp,
+                        )
+                    })
+                {
+                    turns.push(MessageTurn {
+                        id: failure.id,
+                        role: TurnRole::System,
+                        blocks: failure.content,
+                        timestamp: failure.timestamp,
+                        usage: None,
+                        duration_ms: None,
+                        model: None,
+                        completed_at: failure.completed_at,
+                        agent_message_id: None,
+                    });
+                }
+                continue;
+            }
 
             match msg.role.as_str() {
                 "assistant" => {
@@ -458,7 +509,7 @@ impl ClineParser {
         let summary = session_summary(
             manifest,
             messages.updated_at.as_deref(),
-            turns.len() as u32,
+            super::message_turn_count(&turns),
         );
 
         ConversationDetail {
@@ -1538,10 +1589,10 @@ mod tests {
     /// cline 3.0.65 writes a failed run into the transcript as an assistant
     /// message carrying the error text. The record below is verbatim from a
     /// 3.0.65 run against an endpoint that answers 400 — codeg must not show
-    /// it as the model's reply, and skipping it must not swallow the retry and
-    /// the real answer that follow.
+    /// it as the model's reply but as the failure line closing that round, and
+    /// must not swallow the retry and the real answer that follow.
     #[test]
-    fn a_display_only_error_is_not_painted_as_the_reply() {
+    fn a_display_only_error_is_the_failure_line_not_the_reply() {
         let tmp = tempfile::tempdir().unwrap();
         let messages = json!({
             "version": 1,
@@ -1592,10 +1643,20 @@ mod tests {
             turns,
             vec![
                 ("User".to_string(), vec!["say hi"]),
+                ("System".to_string(), vec![]),
                 ("User".to_string(), vec!["try again"]),
                 ("Assistant".to_string(), vec!["Hi!"]),
             ]
         );
+        assert!(
+            matches!(
+                detail.turns[1].blocks.as_slice(),
+                [ContentBlock::TurnError { message }] if message == "probe: model does not exist"
+            ),
+            "{:?}",
+            detail.turns[1].blocks
+        );
+        assert_eq!(detail.summary.message_count, 3);
     }
 
     /// A user message with no wrapper and no tool result is the shape a future

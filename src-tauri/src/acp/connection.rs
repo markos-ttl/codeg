@@ -4968,6 +4968,16 @@ fn build_client_capabilities(
     // empty file, and in patch mode it shows a live Write no diff at all until
     // approval. codex's approval request carries no diff (the started tool
     // call already does). Patch blocks are read by `diff_block_payload`.
+    //
+    // claude-agent-acp 0.89.0 and codex-acp 2.2.0 add "sessionIndex": an
+    // indexed `session/list` with archive and rename, and a pushed list
+    // subscription. It stays out. It serves a list from inside a running
+    // adapter, while codeg reads its list offline from the agents' own
+    // transcripts; undeclared, both adapters keep it inert (see the claude
+    // entry in `registry.rs`, (lll)). The same releases' "customInstructions",
+    // and codex's "codexHooks", are capabilities the AGENT announces; a client
+    // uses them without declaring anything, and codeg uses neither (claude
+    // (mmm), codex (ff)).
     if matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex) {
         let capabilities: &[&str] = if agent_type == AgentType::Codex {
             &["sessionFailure", "asyncTasks", "recommendedValue", "diffPatch"]
@@ -9965,12 +9975,17 @@ async fn handle_fork_or_exit(
     //     map, so the first `session/prompt` hits the `if (!session) throw new
     //     Error("Session not found")` guard at the top of `prompt()`. It also
     //     returns no modes and no config options at all.
-    //   * codex-acp 1.8.0's `SessionFork` calls `threadUnsubscribe` on the
-    //     freshly forked thread to release its writer lock. A prompt on it then
-    //     runs to completion inside codex — the rollout file grows — but the
-    //     core streams no `turn/*` notifications to an unsubscribed thread, so
-    //     `runTurn` awaits a completion event that never arrives: the turn hangs
-    //     forever and not one token reaches the transcript.
+    //   * codex-acp 1.8.0–2.1.x's `SessionFork` calls `threadUnsubscribe` on
+    //     the freshly forked thread to release its writer lock. A prompt on it
+    //     then runs to completion inside codex — the rollout file grows — but
+    //     the core streams no `turn/*` notifications to an unsubscribed thread,
+    //     so `runTurn` awaits a completion event that never arrives: the turn
+    //     hangs forever and not one token reaches the transcript. 2.2.0 keeps
+    //     the fork subscribed, so a prompt on it works at once and the resume
+    //     below is redundant there, but not harmful: measured live, fork →
+    //     resume → close the parent → prompt the fork works on 2.1.1 and 2.2.1
+    //     alike. It stays for the older adapters a PATH or a custom version
+    //     can still resolve.
     //
     // `session/resume` repairs both: claude's `getOrCreateSession` creates the
     // session under the SAME id (`createSession` uses `resume` as the id), and
@@ -10010,7 +10025,8 @@ async fn handle_fork_or_exit(
     // of its own. Left open on the agent, it is not free:
     //
     //   * codex holds a thread's writer lock for as long as an app-server has
-    //     the thread loaded, and `session/fork` unsubscribes only the CHILD.
+    //     the thread loaded, and `session/fork` never lets the PARENT go (up to
+    //     2.1.x it unsubscribes only the child; 2.2.0 not even that).
     //     An open parent stays loaded for the life of this connection, and
     //     opening the sibling row fails with `session_busy`. Closing is
     //     `thread/unsubscribe`, which is also what codex's own TUI does to the
@@ -10242,12 +10258,13 @@ fn classify_session_load_failure(
     //    with the same session open (its lock can outlive the closed tab until
     //    that process unloads the thread);
     //  * codeg itself, for about a minute after a fork: `session/fork`
-    //    releases only the CHILD's lock (`threadUnsubscribe({threadId:
-    //    response.thread.id})`, unchanged since codex-acp 1.8.0), so the
-    //    sibling row codeg creates to keep the pre-fork history hits the lock
-    //    until the forking connection lets the parent go. It closes the parent
-    //    right after the step that resumes the child (`close_forked_parent`),
-    //    and the app-server unloads it `thread_unload_delay_secs` later (60 by
+    //    never releases the PARENT's lock (codex-acp 1.8.0–2.1.x unsubscribe
+    //    only the child, `threadUnsubscribe({threadId: response.thread.id})`,
+    //    and 2.2.0 keeps the child subscribed too), so the sibling row codeg
+    //    creates to keep the pre-fork history hits the lock until the forking
+    //    connection lets the parent go. It closes the parent right after the
+    //    step that resumes the child (`close_forked_parent`), and the
+    //    app-server unloads it `thread_unload_delay_secs` later (60 by
     //    default).
     // codex-acp ≤2.0.x passes codex's raw "thread <id> already has an active
     // writer" through as a -32603 `data.details`; 2.1.0 (#564) answers -32600
@@ -10292,7 +10309,58 @@ fn classify_session_load_error(e: &agent_client_protocol::Error) -> Option<&'sta
     if reason == Some("thread_active_writer") {
         return Some("session_busy");
     }
+    // codex-acp 2.2: the app-server died under the open (see
+    // [`codex_app_server_lost`]). Never the `session/new` fallback, whether or
+    // not the adapter will restart it. Up to 2.1.x a dead app-server took the
+    // connection with it, so that `session/new` failed as well; from 2.2.0 the
+    // adapter restarts the app-server for the next request, and the
+    // `session/new` SUCCEEDS — rebinding the row to a fresh empty session and
+    // orphaning the history the row exists for. Measured live on 2.2.1 with
+    // the app-server killed during each open: resume and load both answer
+    // 1001, and a `session/new` right after them opens. A session whose open
+    // crashes the app-server every time (a rollout too large to load, say)
+    // would take that path on every reopen. The banner keeps the history, and
+    // its Reload opens a new connection, which is also the adapter's own
+    // remedy once it refuses ("Restart the agent").
+    if codex_app_server_lost(e).is_some() {
+        return Some("session_unavailable");
+    }
     classify_session_load_failure(e.code, &e.to_string())
+}
+
+/// codex-acp 2.2's word that the Codex app-server behind the adapter died:
+/// JSON-RPC code 1001 with `data: {exitCode, signal, restartable,
+/// retryAfterMs?}` (`app-server-recovery/AppServerExit.ts`). `Some` carries
+/// `restartable`; `None` is any other error.
+///
+/// From 2.2.0 the adapter supervises the app-server for every client, not only
+/// for the session-index ones: a crash no longer ends the connection, and the
+/// next request starts a new app-server and reopens the session on it. A turn
+/// running at the crash settles at once (`end_turn` with a `connection`
+/// `sessionFailure`, its open tool calls failed, its permission requests
+/// withdrawn by `$/cancel_request`), which codeg's existing consumers already
+/// render. What reaches a REQUEST is this error, two ways:
+///  - `restartable: true` — "The Codex app-server was killed by SIGKILL, which
+///    usually means it ran out of memory. The agent starts it again on the
+///    next request." Only that request failed.
+///  - `restartable: false` — the session cannot come back on this connection:
+///    it never reached disk and the restart lost it ("Session <id> had no
+///    messages yet and was lost when the Codex app-server restarted. Start a
+///    new session.", #604), the crash-loop guard stopped restarting ("crashed
+///    5 times in the last 5 min … Restart the agent, or try again in 5 min."),
+///    or the thread is refused because opening it crashed the app-server twice
+///    (`retryAfterMs` says for how long).
+///
+/// Every message above was captured live over stdio (2.2.1, the app-server
+/// SIGKILLed), bar the refused thread, which is read from the source.
+fn codex_app_server_lost(e: &agent_client_protocol::Error) -> Option<bool> {
+    if !matches!(
+        e.code,
+        agent_client_protocol::schema::v1::ErrorCode::Other(1001)
+    ) {
+        return None;
+    }
+    e.data.as_ref()?.get("restartable")?.as_bool()
 }
 
 /// Wire-message markers for "the session behind this request no longer exists"
@@ -10330,12 +10398,19 @@ const SESSION_GONE_MARKERS: &[&str] =
 /// #659). Tearing the agent down for those is pure self-harm — the user waits
 /// out a full respawn for a turn that merely failed.
 ///
-/// Only three families stay terminal:
+/// Only four families stay terminal:
 ///  - `ResourceNotFound` — the agent has no record of the session id codeg
 ///    just prompted on, so the handle this connection holds is void.
 ///  - [`SESSION_GONE_MARKERS`] — the agent answered to say its session or
 ///    process is gone. Keeping the connection would leave an entry whose every
 ///    future prompt fails the same way.
+///  - [`codex_app_server_lost`] with `restartable: false` — codex-acp 2.2's
+///    word that this session cannot come back on this connection (lost before
+///    it reached disk, the crash-loop guard, a refused thread). Every later
+///    prompt fails the same way, and the remedies the adapter names ("Start a
+///    new session", "Restart the agent") both take a new connection. A
+///    restartable loss stays turn-scoped: the next prompt restarts the
+///    app-server and goes through.
 ///  - [`lost_the_connection`] — the ACP runtime's own word that no answer can
 ///    arrive at all: the transport, not the turn, is what died.
 ///
@@ -10349,6 +10424,9 @@ fn prompt_rejection_is_terminal(e: &agent_client_protocol::Error) -> bool {
         return false;
     }
     if matches!(e.code, agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound) {
+        return true;
+    }
+    if codex_app_server_lost(e) == Some(false) {
         return true;
     }
     if lost_the_connection(e) {
@@ -20574,7 +20652,7 @@ mod tests {
     /// After a codex fork, the sibling row codeg creates to keep the pre-fork
     /// history points at the PARENT thread — whose writer the forking process
     /// holds until codex unloads the thread, about a minute after codeg closes
-    /// it, because `session/fork` only unsubscribes the child. Opening it in
+    /// it, because `session/fork` never unsubscribes the parent. Opening it in
     /// that window must stop with a banner, never fall through to
     /// `session/new`: that rebinds the row to a fresh empty session and
     /// destroys the only pointer to the history the row exists for.
@@ -20690,6 +20768,70 @@ mod tests {
             "data": { "details": "boom" }
         }));
         assert_eq!(classify_session_load_error(&unclassified), None);
+    }
+
+    /// codex-acp 2.2 answers an open the app-server died under with code 1001
+    /// (bodies captured live off 2.2.1, the app-server SIGKILLed). Neither form
+    /// may fall through to `session/new`, which 2.2 now lets succeed on the
+    /// restarted app-server: that would rebind the row to an empty session.
+    #[test]
+    fn classify_load_error_keeps_a_codex_app_server_loss_off_session_new() {
+        let error = |body: serde_json::Value| -> agent_client_protocol::Error {
+            serde_json::from_value(body).expect("an ACP error body")
+        };
+
+        let restarting = error(serde_json::json!({
+            "code": 1001,
+            "message": "The Codex app-server was killed by SIGKILL, which usually means it \
+                ran out of memory. The agent starts it again on the next request.",
+            "data": { "exitCode": null, "signal": "SIGKILL", "restartable": true }
+        }));
+        assert_eq!(codex_app_server_lost(&restarting), Some(true));
+        assert_eq!(
+            classify_session_load_error(&restarting),
+            Some("session_unavailable")
+        );
+
+        let given_up = error(serde_json::json!({
+            "code": 1001,
+            "message": "The Codex app-server crashed 5 times in the last 5 min (last: it was \
+                killed by SIGKILL, which usually means it ran out of memory), so the agent \
+                stopped restarting it. Restart the agent, or try again in 5 min.",
+            "data": {
+                "exitCode": null,
+                "signal": "SIGKILL",
+                "restartable": false,
+                "retryAfterMs": 282346
+            }
+        }));
+        assert_eq!(codex_app_server_lost(&given_up), Some(false));
+        assert_eq!(
+            classify_session_load_error(&given_up),
+            Some("session_unavailable")
+        );
+        // codex's own history is codex's store, so no local recovery: the
+        // banner is the only path that keeps it.
+        assert!(!recovers_load_failure_locally(
+            AgentType::Codex,
+            Some("session_unavailable")
+        ));
+
+        // The shape is the code AND a boolean `restartable`; either alone is
+        // someone else's error and keeps the old ladder.
+        let other_1001 = error(serde_json::json!({
+            "code": 1001,
+            "message": "something else",
+            "data": { "details": "boom" }
+        }));
+        assert_eq!(codex_app_server_lost(&other_1001), None);
+        assert_eq!(classify_session_load_error(&other_1001), None);
+        let not_1001 = error(serde_json::json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": { "restartable": true }
+        }));
+        assert_eq!(codex_app_server_lost(&not_1001), None);
+        assert_eq!(classify_session_load_error(&not_1001), None);
     }
 
     #[test]
@@ -24990,6 +25132,34 @@ mod tests {
             "response to `session/prompt` never received: channel closed",
         );
         assert!(prompt_rejection_is_terminal(&dropped), "{dropped}");
+    }
+
+    /// codex-acp 2.2 rejects a prompt with 1001 when the app-server died. A
+    /// restartable loss costs that turn only (the next prompt restarts the
+    /// app-server and goes through, measured live); an unrestartable one means
+    /// every later prompt on this connection fails the same way, so it ends the
+    /// connection, as the adapter's own remedy needs. The #604 body is verbatim
+    /// off 2.2.1: a session that never reached disk, lost in a restart.
+    #[test]
+    fn an_unrestartable_codex_app_server_loss_ends_the_connection() {
+        let error = |body: serde_json::Value| -> agent_client_protocol::Error {
+            serde_json::from_value(body).expect("an ACP error body")
+        };
+        let lost_empty_session = error(serde_json::json!({
+            "code": 1001,
+            "message": "Session 01a123c6-aee8-7a81-9007-44230bc64566 had no messages yet and \
+                was lost when the Codex app-server restarted. Start a new session.",
+            "data": { "exitCode": null, "signal": null, "restartable": false }
+        }));
+        assert!(prompt_rejection_is_terminal(&lost_empty_session));
+
+        let restarting = error(serde_json::json!({
+            "code": 1001,
+            "message": "The connection to the Codex app-server was lost. The agent starts \
+                it again on the next request.",
+            "data": { "exitCode": null, "signal": null, "restartable": true }
+        }));
+        assert!(!prompt_rejection_is_terminal(&restarting));
     }
 
     /// Plays an agent over the raw pipe: waits for codeg's first frame (the
